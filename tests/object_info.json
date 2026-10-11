@@ -1,0 +1,861 @@
+{
+ "CLIPLoader": {
+  "category": "model/loaders",
+  "description": "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ",
+  "display_name": "Load CLIP",
+  "has_intermediate_output": false,
+  "input": {
+   "optional": {
+    "device": [
+     [
+      "default",
+      "cpu"
+     ],
+     {
+      "advanced": true
+     }
+    ]
+   },
+   "required": {
+    "clip_name": [
+     [
+      "minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+      "t5xxl_fp16.safetensors"
+     ]
+    ],
+    "type": [
+     [
+      "stable_diffusion",
+      "stable_cascade",
+      "sd3",
+      "stable_audio",
+      "mochi",
+      "ltxv",
+      "pixart",
+      "cosmos",
+      "lumina2",
+      "wan",
+      "hidream",
+      "chroma",
+      "ace",
+      "omnigen2",
+      "qwen_image",
+      "hunyuan_image",
+      "flux2",
+      "ovis",
+      "longcat_image",
+      "cogvideox",
+      "lens",
+      "pixeldit",
+      "ideogram4",
+      "boogu",
+      "krea2",
+      "joyimage",
+      "mage",
+      "minimax",
+      "yue2"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "optional": [
+    "device"
+   ],
+   "required": [
+    "clip_name",
+    "type"
+   ]
+  },
+  "is_input_list": false,
+  "name": "CLIPLoader",
+  "output": [
+   "CLIP"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "CLIP"
+  ],
+  "output_node": false,
+  "python_module": "nodes",
+  "search_aliases": []
+ },
+ "ConditioningZeroOut": {
+  "category": "model/conditioning/transform",
+  "description": "",
+  "display_name": "Conditioning Zero Out",
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "conditioning": [
+     "CONDITIONING"
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "conditioning"
+   ]
+  },
+  "is_input_list": false,
+  "name": "ConditioningZeroOut",
+  "output": [
+   "CONDITIONING"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "CONDITIONING"
+  ],
+  "output_node": false,
+  "python_module": "nodes",
+  "search_aliases": [
+   "null conditioning",
+   "clear conditioning"
+  ]
+ },
+ "EmptyMiniMaxMusic3LatentAudio": {
+  "api_node": false,
+  "category": "model/latent/minimax music",
+  "deprecated": false,
+  "description": "Creates an empty MiniMax Music3 audio latent for the requested duration.",
+  "dev_only": false,
+  "display_name": "Empty MiniMax Music3 Latent Audio",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "batch_size": [
+     "INT",
+     {
+      "default": 1,
+      "max": 4096,
+      "min": 1
+     }
+    ],
+    "seconds": [
+     "FLOAT",
+     {
+      "default": 120.0,
+      "max": 360.0,
+      "min": 0.04,
+      "step": 0.04
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "seconds",
+    "batch_size"
+   ]
+  },
+  "is_input_list": false,
+  "name": "EmptyMiniMaxMusic3LatentAudio",
+  "output": [
+   "LATENT"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "LATENT"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_minimax_music",
+  "search_aliases": null
+ },
+ "KSampler": {
+  "category": "model/sampling",
+  "description": "Uses the provided model, positive and negative conditioning to denoise the latent image.",
+  "display_name": "KSampler",
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "cfg": [
+     "FLOAT",
+     {
+      "default": 8.0,
+      "max": 100.0,
+      "min": 0.0,
+      "round": 0.01,
+      "step": 0.1,
+      "tooltip": "The Classifier-Free Guidance scale balances creativity and adherence to the prompt. Higher values result in images more closely matching the prompt however too high values will negatively impact quality."
+     }
+    ],
+    "denoise": [
+     "FLOAT",
+     {
+      "default": 1.0,
+      "max": 1.0,
+      "min": 0.0,
+      "step": 0.01,
+      "tooltip": "The amount of denoising applied, lower values will maintain the structure of the initial image allowing for image to image sampling."
+     }
+    ],
+    "latent_image": [
+     "LATENT",
+     {
+      "tooltip": "The latent image to denoise."
+     }
+    ],
+    "model": [
+     "MODEL",
+     {
+      "tooltip": "The model used for denoising the input latent."
+     }
+    ],
+    "negative": [
+     "CONDITIONING",
+     {
+      "tooltip": "The conditioning describing the attributes you want to exclude from the image."
+     }
+    ],
+    "positive": [
+     "CONDITIONING",
+     {
+      "tooltip": "The conditioning describing the attributes you want to include in the image."
+     }
+    ],
+    "sampler_name": [
+     [
+      "euler",
+      "euler_cfg_pp",
+      "euler_ancestral",
+      "euler_ancestral_cfg_pp",
+      "heun",
+      "heunpp2",
+      "exp_heun_2_x0",
+      "exp_heun_2_x0_sde",
+      "dpm_2",
+      "dpm_2_ancestral",
+      "lms",
+      "dpm_fast",
+      "dpm_adaptive",
+      "dpmpp_2s_ancestral",
+      "dpmpp_2s_ancestral_cfg_pp",
+      "dpmpp_sde",
+      "dpmpp_sde_gpu",
+      "dpmpp_2m",
+      "dpmpp_2m_cfg_pp",
+      "dpmpp_2m_sde",
+      "dpmpp_2m_sde_gpu",
+      "dpmpp_2m_sde_heun",
+      "dpmpp_2m_sde_heun_gpu",
+      "dpmpp_3m_sde",
+      "dpmpp_3m_sde_gpu",
+      "ddpm",
+      "lcm",
+      "ipndm",
+      "ipndm_v",
+      "deis",
+      "cfgpp_ud10_ab",
+      "res_multistep",
+      "res_multistep_cfg_pp",
+      "res_multistep_ancestral",
+      "res_multistep_ancestral_cfg_pp",
+      "gradient_estimation",
+      "gradient_estimation_cfg_pp",
+      "er_sde",
+      "seeds_2",
+      "seeds_3",
+      "sa_solver",
+      "sa_solver_pece",
+      "ddim",
+      "uni_pc",
+      "uni_pc_bh2"
+     ],
+     {
+      "tooltip": "The algorithm used when sampling, this can affect the quality, speed, and style of the generated output."
+     }
+    ],
+    "scheduler": [
+     [
+      "simple",
+      "sgm_uniform",
+      "karras",
+      "exponential",
+      "ddim_uniform",
+      "beta",
+      "normal",
+      "linear_quadratic",
+      "kl_optimal"
+     ],
+     {
+      "tooltip": "The scheduler controls how noise is gradually removed to form the image."
+     }
+    ],
+    "seed": [
+     "INT",
+     {
+      "control_after_generate": true,
+      "default": 0,
+      "max": 18446744073709551615,
+      "min": 0,
+      "tooltip": "The random seed used for creating the noise."
+     }
+    ],
+    "steps": [
+     "INT",
+     {
+      "default": 20,
+      "max": 10000,
+      "min": 1,
+      "tooltip": "The number of steps used in the denoising process."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "model",
+    "seed",
+    "steps",
+    "cfg",
+    "sampler_name",
+    "scheduler",
+    "positive",
+    "negative",
+    "latent_image",
+    "denoise"
+   ]
+  },
+  "is_input_list": false,
+  "name": "KSampler",
+  "output": [
+   "LATENT"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "LATENT"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   "The denoised latent."
+  ],
+  "python_module": "nodes",
+  "search_aliases": [
+   "sampler",
+   "sample",
+   "generate",
+   "denoise",
+   "diffuse",
+   "txt2img",
+   "img2img"
+  ]
+ },
+ "MiniMaxMusic3TextEncode": {
+  "api_node": false,
+  "category": "model/conditioning/minimax music",
+  "deprecated": false,
+  "description": "Uses a MiniMax Music3 CLIP model to generate the acoustic conditioning sequence.",
+  "dev_only": false,
+  "display_name": "MiniMax Music3 Text Encode",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "caption": [
+     "STRING",
+     {
+      "dynamicPrompts": true,
+      "multiline": true
+     }
+    ],
+    "cfg_scale": [
+     "FLOAT",
+     {
+      "advanced": true,
+      "default": 1.5,
+      "max": 100.0,
+      "min": 0.0,
+      "round": 0.01,
+      "step": 0.1
+     }
+    ],
+    "clip": [
+     "CLIP",
+     {}
+    ],
+    "lyrics": [
+     "STRING",
+     {
+      "dynamicPrompts": true,
+      "multiline": true
+     }
+    ],
+    "max_duration": [
+     "FLOAT",
+     {
+      "default": 120.0,
+      "max": 360.0,
+      "min": 0.04,
+      "step": 0.04,
+      "tooltip": "Maximum duration in seconds; the model can end the song earlier."
+     }
+    ],
+    "seed": [
+     "INT",
+     {
+      "control_after_generate": true,
+      "default": 0,
+      "max": 18446744073709551615,
+      "min": 0
+     }
+    ],
+    "top_k": [
+     "INT",
+     {
+      "advanced": true,
+      "default": 50,
+      "max": 16384,
+      "min": 1
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "clip",
+    "caption",
+    "lyrics",
+    "seed",
+    "max_duration",
+    "cfg_scale",
+    "top_k"
+   ]
+  },
+  "is_input_list": false,
+  "name": "MiniMaxMusic3TextEncode",
+  "output": [
+   "CONDITIONING",
+   "FLOAT"
+  ],
+  "output_is_list": [
+   false,
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "CONDITIONING",
+   "seconds"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null,
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_minimax_music",
+  "search_aliases": null
+ },
+ "SaveAudio": {
+  "api_node": false,
+  "category": "audio",
+  "deprecated": true,
+  "description": "",
+  "dev_only": false,
+  "display_name": "Save Audio (FLAC) (DEPRECATED)",
+  "essentials_category": "Audio",
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "hidden": {
+    "extra_pnginfo": [
+     "EXTRA_PNGINFO"
+    ],
+    "prompt": [
+     "PROMPT"
+    ]
+   },
+   "required": {
+    "audio": [
+     "AUDIO",
+     {}
+    ],
+    "filename_prefix": [
+     "STRING",
+     {
+      "default": "audio/ComfyUI",
+      "multiline": false
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "hidden": [
+    "prompt",
+    "extra_pnginfo"
+   ],
+   "required": [
+    "audio",
+    "filename_prefix"
+   ]
+  },
+  "is_input_list": false,
+  "name": "SaveAudio",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "audio"
+  ],
+  "output_node": true,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "export flac"
+  ]
+ },
+ "SaveAudioAdvanced": {
+  "api_node": false,
+  "category": "audio",
+  "deprecated": false,
+  "description": "Saves the input audio to your ComfyUI output directory.",
+  "dev_only": false,
+  "display_name": "Save Audio (Advanced)",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "hidden": {
+    "extra_pnginfo": [
+     "EXTRA_PNGINFO"
+    ],
+    "prompt": [
+     "PROMPT"
+    ]
+   },
+   "required": {
+    "audio": [
+     "AUDIO",
+     {
+      "tooltip": "The audio to save."
+     }
+    ],
+    "filename_prefix": [
+     "STRING",
+     {
+      "default": "audio/ComfyUI",
+      "multiline": false,
+      "tooltip": "The prefix for the file to save. May include formatting tokens such as %date:yyyy-MM-dd%."
+     }
+    ],
+    "format": [
+     "COMFY_DYNAMICCOMBO_V3",
+     {
+      "options": [
+       {
+        "inputs": {
+         "required": {}
+        },
+        "key": "flac"
+       },
+       {
+        "inputs": {
+         "required": {
+          "quality": [
+           "COMBO",
+           {
+            "default": "V0",
+            "multiselect": false,
+            "options": [
+             "V0",
+             "128k",
+             "320k"
+            ]
+           }
+          ]
+         }
+        },
+        "key": "mp3"
+       },
+       {
+        "inputs": {
+         "required": {
+          "quality": [
+           "COMBO",
+           {
+            "default": "128k",
+            "multiselect": false,
+            "options": [
+             "64k",
+             "96k",
+             "128k",
+             "192k",
+             "320k"
+            ]
+           }
+          ]
+         }
+        },
+        "key": "opus"
+       }
+      ],
+      "tooltip": "The file format in which to save the audio."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "hidden": [
+    "prompt",
+    "extra_pnginfo"
+   ],
+   "required": [
+    "audio",
+    "filename_prefix",
+    "format"
+   ]
+  },
+  "is_input_list": false,
+  "name": "SaveAudioAdvanced",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "audio"
+  ],
+  "output_node": true,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "save audio",
+   "export audio",
+   "output audio",
+   "write audio",
+   "flac",
+   "mp3",
+   "opus"
+  ]
+ },
+ "UNETLoader": {
+  "category": "model/loaders",
+  "description": "",
+  "display_name": "Load Diffusion Model",
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "unet_name": [
+     [
+      "flux1-dev.safetensors",
+      "minimax_music3_dit_fp16.safetensors",
+      "minimax_music3_dit_int8_convrot.safetensors"
+     ]
+    ],
+    "weight_dtype": [
+     [
+      "default",
+      "fp8_e4m3fn",
+      "fp8_e4m3fn_fast",
+      "fp8_e5m2"
+     ],
+     {
+      "advanced": true
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "unet_name",
+    "weight_dtype"
+   ]
+  },
+  "is_input_list": false,
+  "name": "UNETLoader",
+  "output": [
+   "MODEL"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "MODEL"
+  ],
+  "output_node": false,
+  "python_module": "nodes",
+  "search_aliases": []
+ },
+ "VAEDecodeAudio": {
+  "api_node": false,
+  "category": "model/latent",
+  "deprecated": false,
+  "description": "",
+  "dev_only": false,
+  "display_name": "VAE Decode Audio",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "samples": [
+     "LATENT",
+     {}
+    ],
+    "vae": [
+     "VAE",
+     {}
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "samples",
+    "vae"
+   ]
+  },
+  "is_input_list": false,
+  "name": "VAEDecodeAudio",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "AUDIO"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "latent to audio"
+  ]
+ },
+ "VAEDecodeAudioTiled": {
+  "api_node": false,
+  "category": "model/latent",
+  "deprecated": false,
+  "description": "",
+  "dev_only": false,
+  "display_name": "VAE Decode Audio (Tiled)",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "overlap": [
+     "INT",
+     {
+      "default": 64,
+      "max": 1024,
+      "min": 0,
+      "step": 8
+     }
+    ],
+    "samples": [
+     "LATENT",
+     {}
+    ],
+    "tile_size": [
+     "INT",
+     {
+      "default": 512,
+      "max": 8192,
+      "min": 32,
+      "step": 8
+     }
+    ],
+    "vae": [
+     "VAE",
+     {}
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "samples",
+    "vae",
+    "tile_size",
+    "overlap"
+   ]
+  },
+  "is_input_list": false,
+  "name": "VAEDecodeAudioTiled",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "AUDIO"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "latent to audio"
+  ]
+ },
+ "VAELoader": {
+  "category": "model/loaders",
+  "description": "",
+  "display_name": "Load VAE",
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "vae_name": [
+     [
+      "ae.safetensors",
+      "minimax_music3_dav.safetensors"
+     ]
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "vae_name"
+   ]
+  },
+  "is_input_list": false,
+  "name": "VAELoader",
+  "output": [
+   "VAE"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_name": [
+   "VAE"
+  ],
+  "output_node": false,
+  "python_module": "nodes",
+  "search_aliases": []
+ }
+}

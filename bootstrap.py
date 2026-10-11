@@ -1,0 +1,1578 @@
+"""
+bootstrap.py - first-launch setup for M3 Studio.
+
+Responsibilities:
+  1. Find a usable Python interpreter (execution test, not PATH lookup).
+  2. Find an existing ComfyUI install, or clone a managed one into ./ComfyUI.
+  3. Create a venv and install torch + ComfyUI requirements (managed mode only).
+  4. Download the MiniMax Music 3 diffusion model, text encoder and audio VAE
+     from HuggingFace, resumable, into the right ComfyUI model folders.
+  5. Launch ComfyUI headless and wait for it to answer /system_stats.
+
+All long work runs on a worker thread and reports into a Progress object that
+the web UI polls.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import requests
+
+APP_DIR = Path(__file__).resolve().parent
+# Config, library and finished tracks. M3_STUDIO_DATA moves the lot, which
+# lets a second copy run without touching the first one's songs — the test
+# suite relies on it, and so does anyone keeping their library on another disk.
+DATA_DIR = Path(os.environ.get("M3_STUDIO_DATA") or (APP_DIR / "data"))
+CONFIG_PATH = DATA_DIR / "config.json"
+
+# Small tools the app fetches for itself live under data/, beside the songs —
+# on the same drive as the install, never scattered into a per-user folder on
+# another disk by a package manager.
+TOOLS_DIR = DATA_DIR / "tools"
+
+COMFY_REPO = "https://github.com/comfyanonymous/ComfyUI.git"
+HF_REPO = "Comfy-Org/MiniMax-Music-3"
+HF_BASE = f"https://huggingface.co/{HF_REPO}/resolve/main"
+
+# MiniMax Music 3 is three files, one per loader, and each loader has more
+# than one acceptable file. A "role" is satisfied by any complete file listed
+# under it; setup downloads the role's default when none is there.
+#
+# The defaults are the ones that run on an 8 GB card. The text encoder is the
+# 8B language model that writes the song frame by frame: even pruned and int8
+# it is about 9 GB, so ComfyUI streams it through the card layer by layer
+# (its dynamic-VRAM path) — slower, but it works, and it needs system RAM to
+# hold what is not on the card. The bf16 encoder is twice that and is only
+# worth it on a 24 GB card.
+#
+# (relative model path, source url, approx bytes, role, default?)
+# Sizes are rounded and used for progress read-outs only; completeness is
+# read from each file's own safetensors header (see model_incomplete).
+MODELS = [
+    ("diffusion_models/minimax_music3_dit_int8_convrot.safetensors",
+     f"{HF_BASE}/diffusion_models/minimax_music3_dit_int8_convrot.safetensors",
+     2_500_000_000, "dit", True),
+    ("text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+     f"{HF_BASE}/text_encoders/minimax_music3_text_encoder_pruned_int8_convrot.safetensors",
+     9_200_000_000, "te", True),
+    ("vae/minimax_music3_dav.safetensors",
+     f"{HF_BASE}/vae/minimax_music3_dav.safetensors",
+     500_000_000, "vae", True),
+    # Alternatives a role also accepts. Not downloaded unless asked for.
+    ("diffusion_models/minimax_music3_dit_fp16.safetensors",
+     f"{HF_BASE}/diffusion_models/minimax_music3_dit_fp16.safetensors",
+     4_900_000_000, "dit", False),
+    ("text_encoders/minimax_music3_text_encoder_pruned_bf16.safetensors",
+     f"{HF_BASE}/text_encoders/minimax_music3_text_encoder_pruned_bf16.safetensors",
+     16_700_000_000, "te", False),
+]
+ROLES = {"dit": "diffusion model", "te": "text encoder", "vae": "audio VAE"}
+# The full-precision diffusion model, offered as an option at setup.
+MODEL_FP16 = MODELS[3]
+
+# Every file of ours carries this; it is how a loader's list is searched.
+MARKER = "music3"
+
+DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
+
+# ComfyUI model folders a download can target, and the ones named in the
+# extra-paths file when the library is kept somewhere other than ComfyUI/models.
+MODEL_FOLDERS = ["diffusion_models", "text_encoders", "vae", "checkpoints",
+                 "loras", "clip", "unet", "audio_encoders", "audio_vae",
+                 "upscale_models"]
+
+
+def clean_url(url) -> str:
+    """A base URL fit to build requests on, or "" if it cannot be made into one.
+
+    No stray whitespace and no trailing slash — appending /system_stats to
+    "http://host:8188/" asks for //system_stats, which is a 404, not a health
+    check. A bare "localhost:8188", which is what people type, gains the
+    scheme it is missing; anything with no host at all comes back empty so the
+    caller can keep whatever address was already working.
+    """
+    text = url.strip().rstrip("/") if isinstance(url, str) else ""
+    if not text:
+        return ""
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or any(ch.isspace() for ch in parts.netloc)):
+        return ""
+    return text
+
+
+def comfy_port(url: str) -> int:
+    """The port to start ComfyUI on, read out of its URL.
+
+    This used to be int(url.rsplit(":")[-1]), which blew up on a trailing
+    slash or a port-less address — typed once into Settings, that config
+    stopped the server from booting at all.
+    """
+    try:
+        port = urlsplit(clean_url(url) or DEFAULT_COMFY_URL).port
+    except ValueError:
+        port = None
+    return port or 8188
+
+
+DEFAULT_CONFIG = {
+    "comfy_url": DEFAULT_COMFY_URL,
+    "comfy_dir": "",       # ComfyUI root (managed or existing)
+    "models_dir": "",      # ComfyUI/models
+    "python": "",          # interpreter used to run ComfyUI
+    "managed": True,       # did we install ComfyUI ourselves?
+    "auto_start_comfy": True,
+    "torch_index": "",     # e.g. https://download.pytorch.org/whl/cu128 ("" = auto)
+    "download_fp16": False,
+    "setup_complete": False,
+}
+
+
+# --------------------------------------------------------------------------- #
+# config
+# --------------------------------------------------------------------------- #
+def load_config() -> dict:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = dict(DEFAULT_CONFIG)
+    if CONFIG_PATH.exists():
+        try:
+            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    # Heal a URL saved before it was normalised — a trailing slash in here
+    # used to keep the whole app from starting.
+    cfg["comfy_url"] = clean_url(cfg.get("comfy_url")) or DEFAULT_COMFY_URL
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# progress reporting
+# --------------------------------------------------------------------------- #
+class Progress:
+    """Thread-safe setup state that the UI polls."""
+
+    STEPS = [
+        ("python", "Check Python"),
+        ("comfyui", "Install ComfyUI"),
+        ("deps", "Install dependencies"),
+        ("models", "Download models"),
+        ("launch", "Start ComfyUI"),
+    ]
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.lines: list[str] = []
+        self.running = False
+        self.done = False
+        self.error: str | None = None
+        self.step = ""
+        self.steps = {k: {"label": v, "state": "pending", "detail": ""}
+                      for k, v in self.STEPS}
+
+    def log(self, msg: str) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        with self._lock:
+            self.lines.append(f"[{stamp}] {msg}")
+            if len(self.lines) > 4000:
+                del self.lines[:2000]
+        print(f"[setup] {msg}", flush=True)
+
+    def begin(self, key: str, detail: str = "") -> None:
+        with self._lock:
+            self.step = key
+            self.steps[key]["state"] = "running"
+            self.steps[key]["detail"] = detail
+
+    def detail(self, key: str, detail: str) -> None:
+        with self._lock:
+            self.steps[key]["detail"] = detail
+
+    def finish(self, key: str, detail: str = "") -> None:
+        with self._lock:
+            self.steps[key]["state"] = "done"
+            if detail:
+                self.steps[key]["detail"] = detail
+
+    def fail(self, key: str, detail: str) -> None:
+        with self._lock:
+            self.steps[key]["state"] = "error"
+            self.steps[key]["detail"] = detail
+
+    def snapshot(self, since: int = 0) -> dict:
+        with self._lock:
+            return {
+                "running": self.running,
+                "done": self.done,
+                "error": self.error,
+                "step": self.step,
+                # A list, in the order the steps actually happen. This used to
+                # be the dict itself, and Flask sorts the keys of every dict it
+                # sends — which listed Check Python last, after the step that
+                # starts the engine, on the one screen where order is the whole
+                # point.
+                "steps": [{"key": key, **self.steps[key]}
+                          for key, _ in self.STEPS],
+                "cursor": len(self.lines),
+                "lines": self.lines[since:],
+            }
+
+
+# --------------------------------------------------------------------------- #
+# python / git discovery
+# --------------------------------------------------------------------------- #
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    # Decode as UTF-8 and never raise on a stray byte. text=True alone reads
+    # the child through the locale encoding, which on a Windows console is
+    # cp1252: the first non-Latin-1 byte a tool prints then ends the read with
+    # a UnicodeDecodeError instead of returning its output.
+    kw.setdefault("encoding", "utf-8")
+    kw.setdefault("errors", "replace")
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def find_python(prog: Progress | None = None) -> str:
+    """Return a real Python 3.10+ interpreter.
+
+    Windows Store stubs answer `where python` but fail on execution, so every
+    candidate is tested by actually running it.
+    """
+    candidates: list[list[str]] = [[sys.executable]]
+    if platform.system() == "Windows":
+        candidates += [["py", "-3.12"], ["py", "-3.11"], ["py", "-3.10"],
+                       ["py", "-3"], ["python"]]
+    else:
+        candidates += [["python3.12"], ["python3.11"], ["python3.10"],
+                       ["python3"], ["python"]]
+
+    for cand in candidates:
+        try:
+            out = _run(cand + ["-c", "import sys;print(sys.executable);"
+                                     "print('%d.%d' % sys.version_info[:2])"],
+                       timeout=25)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        parts = [p.strip() for p in out.stdout.strip().splitlines() if p.strip()]
+        if len(parts) < 2 or not parts[0]:
+            continue
+        try:
+            major, minor = (int(x) for x in parts[1].split("."))
+        except ValueError:
+            continue
+        if (major, minor) >= (3, 10):
+            if prog:
+                prog.log(f"Using Python {parts[1]} at {parts[0]}")
+            return parts[0]
+    raise RuntimeError(
+        "No Python 3.10 or newer found. Install Python from python.org "
+        "(tick 'Add to PATH') and run setup again."
+    )
+
+
+def find_tool(name: str) -> str:
+    """A tool's executable: the copy the app downloaded for itself first, then
+    whatever PATH has. The bundled copy wins so that installing from the Engine
+    page works immediately — nothing has to be added to PATH and nothing has to
+    be restarted for a process that read PATH at startup."""
+    bundled = TOOLS_DIR / name / "bin"
+    for candidate in (bundled / f"{name}.exe", bundled / name):
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which(name) or ""
+
+
+def system_ram() -> int:
+    """Bytes of physical memory, or 0 if it cannot be read."""
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+
+            class _Mem(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            mem = _Mem()
+            mem.dwLength = ctypes.sizeof(_Mem)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(mem)):
+                return int(mem.ullTotalPhys)
+            return 0
+        if platform.system() == "Darwin":
+            out = _run(["sysctl", "-n", "hw.memsize"], timeout=10).stdout
+            return int(out.strip() or 0)
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except Exception:  # noqa: BLE001 - unknown is an answer
+        return 0
+    return 0
+
+
+def gpu_info() -> dict | None:
+    """The first NVIDIA card: {"name", "vram"} in bytes, or None.
+
+    Asked of nvidia-smi rather than torch, so it answers before PyTorch is
+    installed — which is when the advice about an 8 GB card is most useful.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        out = _run(["nvidia-smi", "--query-gpu=name,memory.total",
+                    "--format=csv,noheader,nounits"], timeout=20)
+    except Exception:  # noqa: BLE001
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        name, _, mib = line.rpartition(",")
+        try:
+            return {"name": name.strip(), "vram": int(float(mib)) * 1024 * 1024}
+        except ValueError:
+            continue
+    return None
+
+
+def have_git() -> bool:
+    return shutil.which("git") is not None
+
+
+# --------------------------------------------------------------------------- #
+# ComfyUI discovery
+# --------------------------------------------------------------------------- #
+def detect_comfy_dirs() -> list[str]:
+    """Common locations for an existing ComfyUI install, portable or Desktop."""
+    home = Path.home()
+    # Beside the app first: setup puts ComfyUI in here, and a portable build
+    # unpacked next to the app's folder is the other common layout.
+    near = [APP_DIR, APP_DIR.parent, APP_DIR.parent.parent]
+    cands = [b / "ComfyUI" for b in near] + \
+        [b / "ComfyUI_windows_portable" / "ComfyUI" for b in near] + [
+        home / "ComfyUI",
+        home / "Documents" / "ComfyUI",
+        home / "Desktop" / "ComfyUI",
+        Path("C:/ComfyUI"),
+        Path("C:/ComfyUI_windows_portable/ComfyUI"),
+        Path("D:/ComfyUI"),
+        Path("D:/ComfyUI_windows_portable/ComfyUI"),
+    ]
+    appdata = os.environ.get("APPDATA")
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if appdata:
+        cands += [Path(appdata) / "ComfyUI"]
+    if localappdata:
+        cands += [Path(localappdata) / "Programs" / "@comfyorgcomfyui-electron"
+                  / "resources" / "ComfyUI"]
+    cands += [home / "AppData" / "Local" / "Programs" / "ComfyUI" / "resources"
+              / "ComfyUI"]
+    # A sister app unpacked beside this one — YuE Studio keeps its managed
+    # ComfyUI in <its folder>/ComfyUI. Offering it means one engine, one
+    # PyTorch install and one copy of the card's memory for both apps, instead
+    # of a second 3 GB environment and two engines fighting over 8 GB.
+    try:
+        for sibling in sorted(APP_DIR.parent.iterdir()):
+            if sibling != APP_DIR and sibling.is_dir():
+                cands.append(sibling / "ComfyUI")
+    except OSError:
+        pass
+
+    found = []
+    for c in cands:
+        try:
+            if (c / "main.py").exists():
+                found.append(str(c))
+        except OSError:
+            continue
+    # de-duplicate, preserve order
+    seen, out = set(), []
+    for f in found:
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# saved locations: verified at every start, never trusted
+# --------------------------------------------------------------------------- #
+def rebase_path(old: str) -> Path | None:
+    """Where a path saved under an earlier location of this app lives now.
+
+    The config keeps absolute paths. Move, rename or re-extract the folder
+    (minimax-music-h3 -> MINIMAX-MUSIC-H3-main, C: -> D:) and
+    every one of them points nowhere, though ComfyUI and the weights moved
+    with it. The app's own folder may be the part that was renamed, so its
+    old name cannot be searched for: each tail of the saved path is grafted
+    onto the app's folder instead, longest first, and the first that exists
+    wins.
+    """
+    parts = [p for p in re.split(r"[\\/]+", old or "") if p]
+    for i in range(len(parts)):
+        tail = parts[i:]
+        if any(p.endswith(":") or p in (".", "..") for p in tail):
+            continue                # a drive, or a step out of the app
+        cand = APP_DIR.joinpath(*tail)
+        try:
+            if cand.exists():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def comfy_lost(cfg: dict) -> bool:
+    """True when the ComfyUI folder this setup needs is not where it says.
+
+    External mode (not managed, no folder saved) runs a ComfyUI the person
+    starts themselves, reached by address alone: there is no folder to lose,
+    and adopting one found on disk would have boot start it behind their back.
+    """
+    d = cfg.get("comfy_dir") or ""
+    if not d:
+        return bool(cfg.get("managed", True))
+    try:
+        return not (Path(d) / "main.py").exists()
+    except OSError:
+        return True
+
+
+def heal_paths(cfg: dict) -> list[str]:
+    """Repair saved paths that no longer exist. Returns what changed."""
+    notes: list[str] = []
+    old_comfy = cfg.get("comfy_dir") or ""
+    comfy = Path(old_comfy) if old_comfy else None
+    if not comfy_lost(cfg):
+        comfy = comfy if comfy and (comfy / "main.py").exists() else None
+    else:
+        comfy = None
+        cands = [rebase_path(old_comfy)] + [Path(d) for d in detect_comfy_dirs()]
+        for c in cands:
+            if c and (c / "main.py").exists():
+                cfg["comfy_dir"] = str(c)
+                comfy = c
+                notes.append(f"ComfyUI found at {c}")
+                break
+    old_models = cfg.get("models_dir") or ""
+    if not (old_models and Path(old_models).is_dir()):
+        moved = rebase_path(old_models)
+        if moved and moved.is_dir():
+            cfg["models_dir"] = str(moved)
+        elif comfy and (comfy / "models").is_dir():
+            cfg["models_dir"] = str(comfy / "models")
+        if cfg.get("models_dir") != old_models:
+            notes.append(f"Models folder found at {cfg['models_dir']}")
+    py = cfg.get("python") or ""
+    if py and not Path(py).exists():
+        moved = rebase_path(py)
+        cfg["python"] = str(moved) if moved else ""
+        notes.append(f"Python path {py} is gone"
+                     + (f"; using {moved}" if moved else "; cleared"))
+    return notes
+
+
+# Folders never worth walking into when hunting for ComfyUI: system trees,
+# package caches, and the inside of a ComfyUI (its models alone can hold
+# thousands of entries).
+_SKIP_DIRS = {"windows", "program files", "program files (x86)", "programdata",
+              "$recycle.bin", "system volume information", "recovery",
+              "node_modules", ".git", "__pycache__", "site-packages", "lib",
+              "libs", "scripts", ".cache", ".venv", "venv", "comfy-venv",
+              "python_embeded", "models", "custom_nodes", "output", "input",
+              "temp", "proc", "sys", "dev", "snap"}
+
+
+def is_comfy_dir(path: Path) -> bool:
+    try:
+        return (path / "main.py").is_file() and \
+            (path / "folder_paths.py").is_file()
+    except OSError:
+        return False
+
+
+def search_roots() -> list[Path]:
+    """Where a full search starts: around the app, home, then every drive."""
+    roots = [APP_DIR.parent.parent, Path.home()]
+    if platform.system() == "Windows":
+        roots += [Path(f"{c}:/") for c in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                  if os.path.exists(f"{c}:/")]
+    else:
+        roots += [Path("/opt"), Path("/srv"), Path("/mnt"), Path("/media")]
+    return roots
+
+
+def find_comfy_installs(roots: list[Path] | None = None, max_depth: int = 6,
+                        budget: float = 45.0) -> list[Path]:
+    """Every ComfyUI under `roots`, shallowest first, within a time budget.
+
+    Breadth-first, so the install a person put somewhere sensible is met
+    long before the walk wanders into deep trees, and a slow or huge drive
+    ends the search on time rather than holding up the engine.
+    """
+    deadline = time.monotonic() + budget
+    found: list[Path] = []
+    seen: set[str] = set()
+    queue = [(r, 0) for r in (roots if roots is not None else search_roots())]
+    head = 0
+    while head < len(queue) and time.monotonic() < deadline:
+        path, depth = queue[head]
+        head += 1
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if is_comfy_dir(path):
+            found.append(path)
+            continue                # nothing worth finding inside one
+        if depth >= max_depth:
+            continue
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        if not e.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if e.name.lower() in _SKIP_DIRS or e.name.startswith("."):
+                        continue
+                    queue.append((Path(e.path), depth + 1))
+        except OSError:
+            continue
+    return found
+
+
+def _has_required_weights(models_dir: Path) -> bool:
+    try:
+        return models_dir.is_dir() and not missing_roles(models_dir)
+    except OSError:
+        return False
+
+
+def pick_comfy(installs: list[Path], cfg: dict) -> Path | None:
+    """The install to use: the one holding the Music 3 weights a song needs,
+    then the one inside this app, then the first found."""
+    def score(c: Path) -> tuple:
+        try:
+            inside = c.resolve().is_relative_to(APP_DIR.resolve())
+        except (OSError, ValueError):
+            inside = False
+        return (not _has_required_weights(c / "models"), not inside)
+    return min(installs, key=score) if installs else None
+
+
+def verify_locations(cfg: dict, search: bool = True,
+                     log=None) -> list[str]:
+    """Check every saved location; repair what moved. Returns what changed.
+
+    The quick repair (heal_paths) handles a moved or renamed app folder. When
+    ComfyUI is still nowhere, and `search` is on, the drives are searched.
+    """
+    say = log or (lambda _m: None)
+    notes = heal_paths(cfg)
+    comfy = Path(cfg["comfy_dir"]) if cfg.get("comfy_dir") else None
+    if not search or not (comfy or cfg.get("managed", True)):
+        return notes                # quick check only, or external mode
+    if comfy_lost(cfg):
+        say("Searching this computer for ComfyUI…")
+        comfy = pick_comfy(find_comfy_installs(), cfg)
+        if not comfy:
+            say("No ComfyUI found on this computer — install it from the "
+                "Engine page, or set its folder in Settings.")
+            return notes
+        cfg["comfy_dir"] = str(comfy)
+        notes.append(f"ComfyUI found at {comfy}")
+        models = cfg.get("models_dir") or ""
+        if not (models and Path(models).is_dir()) and \
+                (comfy / "models").is_dir():
+            cfg["models_dir"] = str(comfy / "models")
+            notes.append(f"Models folder found at {cfg['models_dir']}")
+    if cfg.get("setup_complete") and not cfg.get("python"):
+        # A finished setup whose interpreter went with the old folder: the
+        # install's own, found by running it (rule 4). Only on the slow path —
+        # it starts processes, and the quick check must stay quick.
+        own = existing_python(comfy)
+        if own:
+            cfg["python"] = own
+            notes.append(f"Python found at {own}")
+    return notes
+
+
+def location_report(cfg: dict) -> list[str]:
+    """One line per saved location, saying whether it checks out."""
+    out = []
+    comfy = cfg.get("comfy_dir") or ""
+    out.append(f"ComfyUI: {comfy} — ok"
+               if comfy and Path(comfy, "main.py").exists()
+               else "ComfyUI: not found")
+    models = cfg.get("models_dir") or ""
+    if models and Path(models).is_dir():
+        gone = missing_models(Path(models), cfg)
+        out.append(f"Models: {models} — "
+                   + ("all Music 3 weights present" if not gone else
+                      f"{len(gone)} Music 3 file(s) missing"))
+    else:
+        out.append("Models: not found")
+    return out
+
+def venv_python(comfy_dir: Path) -> Path:
+    venv = comfy_dir.parent / "comfy-venv"
+    return venv / ("Scripts/python.exe" if platform.system() == "Windows"
+                   else "bin/python")
+
+
+def _interpreters(comfy_dir: Path) -> list[Path]:
+    """Where a ComfyUI install keeps the interpreter it runs on."""
+    win = platform.system() == "Windows"
+    exe = "Scripts/python.exe" if win else "bin/python"
+    cands = [comfy_dir / "venv" / exe,
+             comfy_dir / ".venv" / exe,
+             comfy_dir.parent / "venv" / exe,
+             comfy_dir.parent / ".venv" / exe,
+             venv_python(comfy_dir)]
+    if win:
+        # ComfyUI_windows_portable ships python_embeded next to the ComfyUI
+        # folder; the Desktop build keeps a standalone runtime instead.
+        cands += [comfy_dir.parent / "python_embeded" / "python.exe",
+                  comfy_dir.parent / "python_standalone" / "python.exe"]
+    else:
+        cands += [comfy_dir.parent / "python_standalone" / "bin" / "python"]
+    return cands
+
+
+def existing_python(comfy_dir: Path) -> str:
+    """The interpreter an existing ComfyUI already runs on, if we can find it.
+
+    Tested by running it, never by its path alone — the same rule as
+    find_python(). An install whose environment has torch wins outright; a
+    working interpreter without torch is the fallback, because it is still that
+    install's own environment and ours has no business replacing it.
+    """
+    fallback = ""
+    for cand in _interpreters(comfy_dir):
+        try:
+            if not cand.exists():
+                continue
+            out = _run([str(cand), "-c", "import importlib.util as u;"
+                                         "print(bool(u.find_spec('torch')))"],
+                       timeout=30)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
+        if out.stdout.strip().splitlines()[-1:] == ["True"]:
+            return str(cand)
+        fallback = fallback or str(cand)
+    return fallback
+
+
+# --------------------------------------------------------------------------- #
+# downloads
+# --------------------------------------------------------------------------- #
+def download(url: str, dest: Path, prog: Progress, key: str,
+             label: str, expected: int = 0) -> None:
+    """Resumable streaming download with a .part file and atomic rename."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    headers = {"Range": f"bytes={have}-"} if have else {}
+
+    with requests.get(url, headers=headers, stream=True, timeout=60,
+                      allow_redirects=True) as r:
+        if r.status_code == 416:  # already complete
+            part.replace(dest)
+            return
+        r.raise_for_status()
+        # A 206 means the server honoured the Range header and Content-Length
+        # covers only what is left; a 200 means it ignored it and is sending the
+        # whole file again, so anything already on disk does not count.
+        resuming = bool(have) and r.status_code == 206
+        mode = "ab" if resuming else "wb"
+        if not resuming:
+            have = 0
+        served = int(r.headers.get("Content-Length", 0))
+        # What the server says the finished file comes to. Only this is worth
+        # checking the result against; `expected` is a rounded catalogue guess
+        # and is used for the progress read-out alone.
+        declared = have + served if served else 0
+        total = declared or expected
+        got = have
+        last = 0.0
+        with open(part, mode) as fh:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                got += len(chunk)
+                now = time.time()
+                if now - last > 0.8:
+                    last = now
+                    pct = (got / total * 100) if total else 0
+                    prog.detail(key, f"{label} — {got/1e9:.2f} GB "
+                                     f"of {total/1e9:.2f} GB ({pct:.0f}%)")
+    if declared and got < declared:
+        # A cut connection can end iter_content() without raising. Promoting
+        # the part file here is what puts a truncated multi-gigabyte model at
+        # the real name, where ComfyUI reports only "[Errno 22] Invalid
+        # argument" and nothing points back to the download. Leave it as
+        # <name>.part instead: the Range header above resumes from exactly
+        # this byte the next time setup runs.
+        raise OSError(
+            f"{dest.name} stopped {(declared - got)/1e6:.0f} MB short of "
+            f"{declared/1e9:.2f} GB. Run setup again to resume it.")
+    part.replace(dest)
+    prog.log(f"Downloaded {dest.name} ({dest.stat().st_size/1e9:.2f} GB)")
+
+
+# --------------------------------------------------------------------------- #
+# ComfyUI process
+# --------------------------------------------------------------------------- #
+# ComfyUI colours its output. Left in, the escapes reach the Engine console as
+# literal "[32m[INFO][0m" noise around every line the engine prints.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI.sub("", text)
+
+
+class ComfyProcess:
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.lines: list[str] = []
+        # What the last managed engine exited with, once it has. None while one
+        # is running, and the difference between "still starting" and "it died"
+        # — which the Engine page had no way to tell apart.
+        self.exit_code: int | None = None
+        # ComfyUI answers its port, and prints its "Starting server" banner,
+        # at different moments. Until the banner, what is answering is an
+        # engine still putting itself together — which is not something to
+        # call ready.
+        self.serving = False
+        self.started_at = 0.0
+        self._lock = threading.Lock()
+
+    def note(self, msg: str) -> None:
+        """An app-side line in the engine console.
+
+        What M3 Studio does *to* the engine — taking a port back, stopping a
+        pid, adopting what is already there — belongs in the same ring buffer
+        as what the engine itself says, in the order it happened. Split across
+        two logs, neither one explains the other.
+        """
+        with self._lock:
+            self.lines.append(f"[M3 Studio] {msg}")
+            if len(self.lines) > 2000:
+                del self.lines[:1000]
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, python: str, comfy_dir: Path, port: int,
+              prog: Progress, models_dir: Path | None = None) -> None:
+        """Raises RuntimeError with a sentence a person can act on. A ComfyUI
+        folder that has moved, or an interpreter that is gone, is an engine
+        that cannot start — never a reason the whole app fails to boot."""
+        if self.alive():
+            return
+        self.exit_code = None
+        self.serving = False
+        self.started_at = time.time()
+        if not (comfy_dir / "main.py").exists():
+            raise RuntimeError(
+                f"There is no ComfyUI at {comfy_dir} any more — the folder "
+                "has moved or been deleted. Run setup again from Settings.")
+        # main.py by its full path: ComfyUI reports its argv in /system_stats,
+        # and that is how the Engine row says which install is answering. A
+        # bare "main.py" names no folder, so our own engine read as one that
+        # "does not say where it runs from".
+        main = os.path.abspath(comfy_dir / "main.py")
+        cmd = [python, main, "--listen", "127.0.0.1", "--port", str(port),
+               "--disable-auto-launch"]
+        # Whatever models folder was chosen is handed to ComfyUI here, so the
+        # setting actually moves where songs are loaded from rather than only
+        # where they are downloaded to.
+        if models_dir:
+            extra = model_paths_file(comfy_dir, models_dir)
+            if extra:
+                cmd += ["--extra-model-paths-config", str(extra)]
+                prog.log(f"Models folder: {models_dir}")
+        prog.log("Launching ComfyUI: " + " ".join(cmd))
+        creation = 0
+        if platform.system() == "Windows":
+            creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, cwd=str(comfy_dir), stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                encoding="utf-8", errors="replace",
+                creationflags=creation,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"ComfyUI could not be started with {python} — {exc}. "
+                "Run setup again from Settings.") from exc
+        threading.Thread(target=self._pump, args=(self.proc, prog),
+                         daemon=True).start()
+
+    def _pump(self, proc: subprocess.Popen, prog: Progress) -> None:
+        """Copy the engine's output into the console until it stops.
+
+        The process is passed in rather than read off self, so a restart that
+        replaces it cannot make this thread narrate the wrong engine.
+        """
+        try:
+            assert proc.stdout
+            for line in proc.stdout:
+                line = strip_ansi(line.rstrip())
+                with self._lock:
+                    self.lines.append(line)
+                    if len(self.lines) > 2000:
+                        del self.lines[:1000]
+                if any(k in line for k in ("Starting server",
+                                           "To see the GUI")):
+                    self.serving = True
+                if any(k in line for k in ("Error", "Traceback", "error:",
+                                           "Starting server", "To see the GUI")):
+                    prog.log(f"ComfyUI: {line}")
+        except Exception as exc:  # noqa: BLE001
+            # Reading the engine is not the engine failing, and a reader that
+            # dies quietly is worse than one that says so: the console simply
+            # stops mid-start and the page goes on saying "not answering"
+            # while ComfyUI may still be running perfectly well.
+            self.note(f"Lost the engine's output ({type(exc).__name__}: {exc}). "
+                      "It may still be starting — the console stops here, the "
+                      "engine does not.")
+        # Its output has ended, so it is on its way out. Say what it came to.
+        try:
+            code = proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            return
+        if self.proc is not proc:
+            return                        # already replaced by a restart
+        self.exit_code = code
+        if code == 0:
+            self.note("ComfyUI exited normally (code 0) without being asked to.")
+        else:
+            self.note(f"ComfyUI stopped on its own, exit code {code}. "
+                      "The reason is the last thing it printed above.")
+        prog.log(f"ComfyUI exited with code {code}.")
+
+    def tail(self, n: int = 40) -> list[str]:
+        with self._lock:
+            return self.lines[-n:]
+
+    def stop(self) -> None:
+        if self.alive():
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=15)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+
+
+def wait_for_comfy(url: str, timeout: int = 900, on_wait=None) -> bool:
+    """Poll until ComfyUI answers.
+
+    `on_wait(elapsed, timeout)` runs on every pass. A model load has no
+    percentage to report, so the only honest progress is how long it has
+    been waiting — which is what stops a slow first start looking like a hang.
+    """
+    started = time.time()
+    deadline = started + timeout
+    while time.time() < deadline:
+        try:
+            r = requests.get(f"{url}/system_stats", timeout=4)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        if on_wait:
+            try:
+                on_wait(time.time() - started, timeout)
+            except Exception:
+                pass
+        time.sleep(2)
+    return False
+
+
+def comfy_online(url: str) -> bool:
+    try:
+        return requests.get(f"{url}/system_stats", timeout=3).status_code == 200
+    except Exception:
+        return False
+
+
+def comfy_stats(url: str) -> dict | None:
+    """What is actually answering on the address, or None if nothing is.
+
+    The `.system` dict carries argv, and argv[0] names the main.py the engine
+    was launched from — the only way to tell *which* install holds the port.
+    """
+    try:
+        r = requests.get(f"{url}/system_stats", timeout=3)
+        if r.status_code == 200:
+            return (r.json() or {}).get("system") or {}
+    except Exception:
+        pass
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# who holds a port
+#
+# An engine M3 Studio did not start is still an engine in the way, and the
+# old advice — "close it yourself" — sent people hunting a windowless python
+# in Task Manager. These find it, name it, and stop it.
+# --------------------------------------------------------------------------- #
+def _pids_from_proc_net(port: int) -> list[int]:
+    """Linux, with no external tools: the listening socket's inode out of
+    /proc/net/tcp*, then the process whose fd table holds it.
+
+    lsof is not installed everywhere and ss output differs between distros;
+    /proc is always there on the platform this runs on.
+    """
+    inodes = set()
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = Path(name).read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local, state, inode = parts[1], parts[3], parts[9]
+            # 0A is TCP_LISTEN; the local port is four uppercase hex digits.
+            if state == "0A" and local.rsplit(":", 1)[-1] == f"{port:04X}":
+                inodes.add(inode)
+    if not inodes:
+        return []
+    wanted = {f"socket:[{i}]" for i in inodes}
+    pids = set()
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            for fd in (proc / "fd").iterdir():
+                try:
+                    target = os.readlink(fd)
+                except OSError:
+                    continue
+                if target in wanted:
+                    pids.add(int(proc.name))
+                    break
+        except OSError:
+            continue        # a process that exited mid-scan, or another user's
+    return sorted(pids)
+
+
+def port_pids(port: int) -> list[int]:
+    """Whoever is listening on the port."""
+    if platform.system() == "Windows":
+        pids = set()
+        try:
+            out = _run(["netstat", "-ano", "-p", "TCP"], timeout=25).stdout
+        except Exception:
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and parts[0] == "TCP"
+                    and parts[3] == "LISTENING"
+                    and parts[1].rsplit(":", 1)[-1] == str(port)):
+                try:
+                    pids.add(int(parts[4]))
+                except ValueError:
+                    pass
+        return sorted(pids)
+    found = _pids_from_proc_net(port)
+    if found:
+        return found
+    if shutil.which("lsof"):
+        try:
+            out = _run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                       timeout=25).stdout
+            return sorted({int(t) for t in out.split() if t.strip().isdigit()})
+        except Exception:
+            pass
+    return []
+
+
+def pid_cmdline(pid: int) -> str:
+    """The command line a pid was started with, or "" if it cannot be read.
+
+    This is what decides whether a process gets stopped: anything that does
+    not look like ComfyUI is named back to the person instead.
+    """
+    try:
+        if platform.system() == "Windows":
+            out = _run(["wmic", "process", "where", f"processid={pid}",
+                        "get", "commandline"], timeout=25).stdout
+            lines = [ln.strip() for ln in out.splitlines()
+                     if ln.strip() and "CommandLine" not in ln]
+            return lines[0] if lines else ""
+        cmd = Path(f"/proc/{pid}/cmdline")
+        if cmd.exists():
+            return cmd.read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace").strip()
+        return _run(["ps", "-p", str(pid), "-o", "command="],
+                    timeout=25).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _pid_gone(pid: int) -> bool:
+    """True once the pid is no longer a running process.
+
+    A zombie still answers kill(pid, 0): it keeps its pid until its parent
+    reaps it, while holding no sockets and running no code. Counting one as
+    alive costs five seconds of polling and then reports a SIGKILL that
+    stopped nothing — the opposite of what kill_pid is for.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    try:
+        # "12 (a name with spaces) Z 1 ..." — split after the last ')'.
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[-1].split()
+        return bool(state) and state[0] == "Z"
+    except OSError:
+        return False
+
+
+def kill_pid(pid: int) -> str:
+    """Stop a process: politely first, firmly if it lingers.
+
+    Returns what the system said — "stopped", "already gone", "access denied",
+    "sent SIGKILL" — so a refusal can be *shown* rather than guessed at. An
+    access-denied is the whole diagnosis on Windows, and swallowing it turns a
+    one-line answer ("run as administrator") into an unexplained failure.
+    """
+    if platform.system() == "Windows":
+        try:
+            out = _run(["taskkill", "/PID", str(pid), "/T", "/F"], timeout=30)
+            return (out.stdout or out.stderr or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            return str(exc)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already gone"
+    except PermissionError:
+        return "access denied"
+    for _ in range(25):
+        time.sleep(0.2)
+        if _pid_gone(pid):
+            return "stopped"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped"
+    except PermissionError:
+        return "access denied"
+    return "sent SIGKILL"
+
+
+# --------------------------------------------------------------------------- #
+# the setup run
+# --------------------------------------------------------------------------- #
+def model_paths_file(comfy_dir: Path, models_dir: Path) -> Path | None:
+    """Point ComfyUI at a models folder that is not its own, or None if it is.
+
+    Setting a models folder used to move only where files were downloaded and
+    looked for — ComfyUI went on reading ComfyUI/models and never saw them, so
+    the setting looked applied while the songs still could not find a model.
+    ComfyUI takes --extra-model-paths-config, so the choice is written out as
+    one of those and handed over when the engine starts.
+
+    Returns None when the folder already is ComfyUI's own, which needs no file.
+    """
+    try:
+        if models_dir.resolve() == (comfy_dir / "models").resolve():
+            return None
+    except OSError:
+        return None
+    if not models_dir.is_dir():
+        return None
+    body = ["# Written by M3 Studio from the models folder set in Settings.",
+            "# Edit that setting rather than this file: it is rewritten on",
+            "# every start.", "m3_studio:",
+            f"  base_path: {models_dir.as_posix()}",
+            "  is_default: true"]
+    body += [f"  {folder}: {folder}/" for folder in MODEL_FOLDERS]
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "extra_model_paths.yaml"
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    return path
+
+
+def safetensors_size(path: Path) -> int | None:
+    """The total byte length a .safetensors file declares for itself.
+
+    The format opens with a little-endian u64 giving the length of a JSON
+    header, and that header lists every tensor with its ``data_offsets`` into
+    the block that follows. The end of the last tensor is therefore the exact
+    size the file ought to be, read from the file itself — which stays correct
+    however far a catalogue's rounded figure drifts from what the repository
+    actually ships. Returns None when this is not a safetensors file, or when
+    it is damaged so early that the header cannot be parsed.
+    """
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(8)
+            if len(raw) < 8:
+                return None
+            head = int.from_bytes(raw, "little")
+            # A real header is kilobytes to a few megabytes of JSON. A wild
+            # number here means the first eight bytes are not a length at all.
+            if not 0 < head <= 100_000_000:
+                return None
+            body = fh.read(head)
+        if len(body) < head:
+            return None
+        meta = json.loads(body.decode("utf-8"))
+        if not isinstance(meta, dict):
+            return None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    end = 0
+    for name, spec in meta.items():
+        if name == "__metadata__" or not isinstance(spec, dict):
+            continue
+        offsets = spec.get("data_offsets")
+        if isinstance(offsets, (list, tuple)) and len(offsets) == 2:
+            try:
+                end = max(end, int(offsets[1]))
+            except (TypeError, ValueError):
+                continue
+    # A header that parsed but named no tensor data still fixes a floor: the
+    # header itself has to be all there. Erring low is the safe direction —
+    # it can only ever call a real file complete, never call a complete file
+    # missing and take the Create button away over it.
+    return 8 + head + end
+
+
+def model_incomplete(path: Path, expected: int = 0) -> bool:
+    """True when a model file is absent or is provably a partial download.
+
+    Older releases treated any directory entry as a complete multi-gigabyte
+    model. A cancelled or hand-copied download could therefore make setup
+    green and reach the Music 3 loaders, which then fail with an error that
+    names a tensor rather than the download.
+
+    Completeness is read out of the file wherever it can be. A truncated
+    download still carries an intact header — the header is the first thing
+    written — so the length it declares is exactly what catches it, with no
+    catalogue figure involved. That matters because the figures in ``MODELS``
+    are rounded approximations: gating on one directly (the old check wanted
+    95% of it) turns a single stale number into a model that can never be
+    seen as present, and a model reported missing takes the Create button
+    away entirely and sends people to re-fetch gigabytes they already have.
+    The catalogue is used only as a coarse floor for a file that cannot
+    describe itself, where the job is just to reject an error page or an
+    empty stub rather than to second-guess a real model's size.
+    """
+    try:
+        if not path.is_file():
+            return True
+        actual = path.stat().st_size
+    except OSError:
+        return True
+    declared = safetensors_size(path)
+    if declared:
+        return actual < declared
+    if path.suffix.lower() == ".safetensors":
+        # Named as one but with an unreadable header: too damaged to load.
+        return True
+    return actual < min(expected, 1_000_000) if expected else actual == 0
+
+
+# ComfyUI reads each folder under two names: the old "clip" and "unet" are
+# aliases of text_encoders and diffusion_models, and installs that predate the
+# rename still keep their files there.
+FOLDER_ALIASES = {"text_encoders": ("clip",), "diffusion_models": ("unet",)}
+
+
+def model_path(models_dir: Path, rel: str) -> Path:
+    """Where a catalogue file is on disk: its own folder, or the old alias
+    that ComfyUI also reads. The canonical path when it is in neither."""
+    folder, name = rel.split("/", 1)
+    for alt in (folder, *FOLDER_ALIASES.get(folder, ())):
+        cand = models_dir / alt / name
+        if cand.is_file():
+            return cand
+    return models_dir / rel
+
+
+def role_present(models_dir: Path, role: str) -> str:
+    """The name of a complete file that fills `role`, or "" if none does."""
+    for m in MODELS:
+        if m[3] == role and not model_incomplete(model_path(models_dir, m[0]),
+                                                 m[2]):
+            return Path(m[0]).name
+    return ""
+
+
+def missing_roles(models_dir: Path) -> list[str]:
+    """The loaders that have no complete file to load: what stops a song."""
+    return [role for role in ROLES if not role_present(models_dir, role)]
+
+
+def missing_models(models_dir: Path, cfg: dict) -> list[tuple]:
+    """Downloads still to do, as (path, url, bytes, required).
+
+    For a role with no file at all, its default (the 8 GB-friendly one). The
+    full-precision diffusion model is added only when asked for, and is never
+    required — the int8 one fills the same role.
+    """
+    out: list[tuple] = []
+    for role in missing_roles(models_dir):
+        rel, url, size, _role, _default = next(
+            m for m in MODELS if m[3] == role and m[4])
+        out.append((rel, url, size, True))
+    if cfg.get("download_fp16") and model_incomplete(
+            model_path(models_dir, MODEL_FP16[0]), MODEL_FP16[2]):
+        out.append((MODEL_FP16[0], MODEL_FP16[1], MODEL_FP16[2], False))
+    return out
+
+
+def run_setup(cfg: dict, prog: Progress, comfy: ComfyProcess,
+              chosen_dir: str = "", mode: str = "auto") -> None:
+    """Executed on a worker thread. mode: auto | existing | managed | external."""
+    prog.running = True
+    prog.done = False
+    prog.error = None
+    try:
+        # ---- 1. python -------------------------------------------------- #
+        prog.begin("python")
+        if mode == "external":
+            prog.finish("python", "Not needed — using a ComfyUI you run yourself")
+            py = cfg.get("python") or sys.executable
+        else:
+            py = find_python(prog)
+            cfg["python"] = py
+            prog.finish("python", py)
+
+        # ---- 2. comfyui ------------------------------------------------- #
+        prog.begin("comfyui")
+        if mode == "external":
+            url = cfg["comfy_url"]
+            prog.log(f"Using ComfyUI already running at {url}")
+            if not comfy_online(url):
+                raise RuntimeError(
+                    f"Nothing is answering at {url}. Start ComfyUI first, or "
+                    f"switch to a managed install."
+                )
+            cfg["managed"] = False
+            if not cfg.get("models_dir"):
+                raise RuntimeError(
+                    "Set the ComfyUI models folder in Settings so the model "
+                    "files land in the right place."
+                )
+            prog.finish("comfyui", url)
+        else:
+            if chosen_dir:
+                comfy_dir = Path(chosen_dir)
+                cfg["managed"] = False
+                prog.log(f"Using existing ComfyUI at {comfy_dir}")
+                # Their install runs on its own interpreter. Recording the one
+                # we happened to find on PATH would start ComfyUI without the
+                # torch it needs, and would aim any later dependency install at
+                # the wrong environment.
+                own = existing_python(comfy_dir)
+                if own:
+                    cfg["python"] = own
+                    prog.log(f"That install runs on {own}")
+                else:
+                    cfg["python"] = ""
+                    prog.log("Could not find the Python environment that "
+                             "install uses — start ComfyUI yourself and "
+                             "M3 Studio will connect to it.")
+            else:
+                comfy_dir = APP_DIR / "ComfyUI"
+                cfg["managed"] = True
+                if not (comfy_dir / "main.py").exists():
+                    if not have_git():
+                        raise RuntimeError(
+                            "Git is not installed, so ComfyUI cannot be "
+                            "downloaded. Install Git, or point M3 Studio at an "
+                            "existing ComfyUI folder in Settings."
+                        )
+                    prog.detail("comfyui", "Cloning ComfyUI from GitHub…")
+                    prog.log("git clone " + COMFY_REPO)
+                    res = _run(["git", "clone", "--depth", "1", COMFY_REPO,
+                                str(comfy_dir)])
+                    if res.returncode != 0:
+                        raise RuntimeError("git clone failed: " +
+                                           (res.stderr or res.stdout)[-600:])
+                else:
+                    prog.detail("comfyui", "Updating ComfyUI…")
+                    _run(["git", "-C", str(comfy_dir), "pull", "--ff-only"])
+            if not (comfy_dir / "main.py").exists():
+                raise RuntimeError(f"No main.py in {comfy_dir}. "
+                                   "That folder is not a ComfyUI install.")
+            cfg["comfy_dir"] = str(comfy_dir)
+            cfg["models_dir"] = str(comfy_dir / "models")
+            prog.finish("comfyui", str(comfy_dir))
+
+        models_dir = Path(cfg["models_dir"])
+
+        # ---- 3. dependencies -------------------------------------------- #
+        prog.begin("deps")
+        if mode == "external":
+            prog.finish("deps", "Managed by your own ComfyUI install")
+        elif cfg["managed"]:
+            comfy_dir = Path(cfg["comfy_dir"])
+            vpy = venv_python(comfy_dir)
+            if not vpy.exists():
+                prog.detail("deps", "Creating virtual environment…")
+                prog.log(f"Creating venv at {vpy.parent.parent / 'comfy-venv'}")
+                res = _run([py, "-m", "venv", str(comfy_dir.parent / "comfy-venv")])
+                if res.returncode != 0:
+                    raise RuntimeError("venv creation failed: " +
+                                       (res.stderr or res.stdout)[-600:])
+            index = cfg.get("torch_index") or _torch_index()
+            prog.detail("deps", "Installing PyTorch (this takes a while)…")
+            _pip(vpy, ["install", "--upgrade", "pip", "wheel"], prog)
+            torch_args = ["install", "torch", "torchaudio", "torchvision"]
+            if index:
+                torch_args += ["--index-url", index]
+            _pip(vpy, torch_args, prog)
+            prog.detail("deps", "Installing ComfyUI requirements…")
+            _pip(vpy, ["install", "-r", str(comfy_dir / "requirements.txt")], prog)
+            cfg["python"] = str(vpy)
+            prog.finish("deps", "PyTorch and ComfyUI requirements installed")
+        else:
+            # Existing install: assume its own environment already works.
+            prog.finish("deps", "Existing ComfyUI environment left untouched")
+
+        # ---- 4. models --------------------------------------------------- #
+        prog.begin("models")
+        todo = missing_models(models_dir, cfg)
+        if not todo:
+            prog.finish("models", "All model files already present")
+        else:
+            gb = sum(m[2] for m in todo) / 1e9
+            prog.log(f"{len(todo)} model file(s) to download, about {gb:.1f} GB")
+            for rel, url, size, _req in todo:
+                prog.detail("models", f"Downloading {Path(rel).name}…")
+                download(url, models_dir / rel, prog, "models",
+                         Path(rel).name, size)
+            prog.finish("models", "Models ready")
+
+        # ---- 5. launch ---------------------------------------------------- #
+        prog.begin("launch")
+        url = cfg["comfy_url"]
+        if mode == "external" or not cfg.get("auto_start_comfy", True):
+            if not comfy_online(url):
+                raise RuntimeError(f"ComfyUI is not answering at {url}.")
+        else:
+            port = comfy_port(url)
+            if comfy_online(url):
+                prog.log(f"ComfyUI already running on port {port}")
+            elif not cfg.get("python"):
+                raise RuntimeError(
+                    f"Start ComfyUI yourself and make sure it answers at {url}. "
+                    "M3 Studio could not work out which Python that install "
+                    "uses, so it will not try to start it for you.")
+            else:
+                comfy.start(cfg["python"], Path(cfg["comfy_dir"]), port, prog,
+                            Path(cfg["models_dir"]) if cfg.get("models_dir")
+                            else None)
+                prog.detail("launch", "Waiting for ComfyUI to come up "
+                                      "(first start loads slowly)…")
+                if not wait_for_comfy(url, timeout=900):
+                    tail = "\n".join(comfy.tail(25))
+                    raise RuntimeError("ComfyUI did not start within 15 minutes."
+                                       f"\nLast output:\n{tail}")
+        prog.finish("launch", url)
+
+        cfg["setup_complete"] = True
+        save_config(cfg)
+        prog.done = True
+        prog.log("Setup complete. M3 Studio is ready.")
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+        prog.error = str(exc)
+        if prog.step:
+            prog.fail(prog.step, str(exc))
+        prog.log(f"FAILED: {exc}")
+    finally:
+        prog.running = False
+
+
+def _torch_index() -> str:
+    """Pick a sensible torch wheel index for this machine."""
+    system = platform.system()
+    if system == "Darwin":
+        return ""  # CPU/MPS wheels from PyPI
+    if _has_nvidia():
+        return "https://download.pytorch.org/whl/cu128"
+    if system == "Linux":
+        return "https://download.pytorch.org/whl/cpu"
+    return "https://download.pytorch.org/whl/cpu"
+
+
+def _has_nvidia() -> bool:
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        return _run(["nvidia-smi"], timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+def stream_lines(stream):
+    """What a subprocess writes, with a carriage return counting as a break.
+
+    pip redraws its progress bar over itself with \r; read only on newlines
+    and nothing appears until the download has already finished.
+    """
+    buffer = ""
+    while True:
+        char = stream.read(1)
+        if not char:
+            break
+        if char in ("\r", "\n"):
+            if buffer.strip():
+                yield buffer.strip()
+            buffer = ""
+        else:
+            buffer += char
+    if buffer.strip():
+        yield buffer.strip()
+
+
+def pip_progress(line: str, state: dict) -> str | None:
+    """Turn one line of pip output into something worth reading.
+
+    `--progress-bar raw` prints "Progress 123 of 456" as it goes, which is the
+    only account of a multi-gigabyte download that survives being piped — pip
+    draws no bar unless it is talking to a terminal.
+    """
+    if line.startswith("Downloading "):
+        state["what"] = "Downloading " + (line.split()[1].split("-")[0]
+                                          or "package")
+        state["at"] = 0
+        state["total"] = 0
+        state["since"] = time.time()
+        return None
+    if line.startswith("Installing collected packages"):
+        # Nothing is printed again until this finishes, and for a 2.7 GB
+        # PyTorch that is minutes of writing thousands of files. Say which
+        # part is slow rather than leaving the last download's name up.
+        state["what"] = "Unpacking and installing — the slow part"
+        return None
+    if line.startswith(("Building", "Preparing", "Getting requirements")):
+        state["what"] = line[:60]
+        return None
+    if not line.startswith("Progress "):
+        return None
+    parts = line.split()
+    try:
+        got, total = int(parts[1]), int(parts[3])
+    except (IndexError, ValueError):
+        return None
+    state["at"], state["total"] = got, total
+    elapsed = max(time.time() - state.get("since", time.time()), 0.001)
+    speed = got / elapsed
+    left = (total - got) / speed if speed > 0 else 0
+    what = state.get("what", "package").replace("Downloading ", "")
+    if total <= 0:
+        return f"{what} — {got/1e6:.0f} MB so far"
+    size = ((f"{got/1e9:.2f} of {total/1e9:.2f} GB") if total >= 1e9
+            else (f"{got/1e6:.0f} of {total/1e6:.0f} MB"))
+    head = f"{what} — {size} ({got * 100 // total}%)"
+    # A rate measured over the first fraction of a second is nonsense — a
+    # resumed file can report a whole chunk at once and read as 1288490 MB/s.
+    if elapsed < 1.5 or speed <= 0:
+        return head
+    return (f"{head} · {speed/1e6:.1f} MB/s · "
+            f"{int(left // 60)}m {int(left % 60):02d}s left")
+
+
+def _pip_raw_progress(python: Path | str) -> list[str]:
+    """`--progress-bar raw` if this pip is new enough to know the word."""
+    try:
+        out = _run([str(python), "-m", "pip", "--version"], timeout=60)
+        major, minor = (int(n) for n in
+                        re.search(r"pip (\d+)\.(\d+)", out.stdout).groups())
+    except Exception:  # noqa: BLE001
+        return []
+    return ["--progress-bar", "raw"] if (major, minor) >= (23, 1) else []
+
+
+def _pip(python: Path | str, args: list[str], prog: Progress,
+         key: str = "deps") -> None:
+    cmd = [str(python), "-m", "pip"] + args
+    if args and args[0] == "install":
+        cmd += _pip_raw_progress(python)
+    prog.log("pip " + " ".join(args[:4]))
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=0,
+                            encoding="utf-8", errors="replace")
+    assert proc.stdout
+
+    state: dict = {}
+    last_shown = [0.0]
+    stop = threading.Event()
+
+    def tick() -> None:
+        # Unpacking a 2.7 GB wheel says nothing for minutes. Keep a clock
+        # running so the panel never looks like it has died.
+        while not stop.wait(5):
+            if time.time() - last_shown[0] < 5:
+                continue
+            waited = int(time.time() - started)
+            prog.detail(key, f"{state.get('what') or 'Working'} — "
+                             f"{waited // 60}m {waited % 60:02d}s so far")
+
+    started = time.time()
+    threading.Thread(target=tick, daemon=True).start()
+    try:
+        for line in stream_lines(proc.stdout):
+            detail = pip_progress(line, state)
+            if detail and time.time() - last_shown[0] > 0.5:
+                last_shown[0] = time.time()
+                prog.detail(key, detail)
+            elif line.startswith(("Collecting", "Downloading", "Installing",
+                                  "Successfully", "ERROR", "Building")):
+                prog.log(line[:200])
+    finally:
+        stop.set()
+    if proc.wait() != 0:
+        raise RuntimeError("pip " + " ".join(args[:3]) + " failed — see the log.")
