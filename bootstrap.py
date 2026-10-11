@@ -136,7 +136,7 @@ DEFAULT_CONFIG = {
     "python": "",          # interpreter used to run ComfyUI
     "managed": True,       # did we install ComfyUI ourselves?
     "auto_start_comfy": True,
-    "torch_index": "",     # e.g. https://download.pytorch.org/whl/cu128 ("" = auto)
+    "torch_index": "",     # e.g. https://download.pytorch.org/whl/cu130 ("" = auto)
     "download_fp16": False,
     "setup_complete": False,
 }
@@ -1441,7 +1441,10 @@ def _torch_index() -> str:
     if system == "Darwin":
         return ""  # CPU/MPS wheels from PyPI
     if _has_nvidia():
-        return "https://download.pytorch.org/whl/cu128"
+        # cu130: current ComfyUI turns its CUDA kernels off on anything older,
+        # and says so in its own log — on an RTX 20-series or newer card that
+        # is the int8 path Music 3's 8 GB files depend on.
+        return "https://download.pytorch.org/whl/cu130"
     if system == "Linux":
         return "https://download.pytorch.org/whl/cpu"
     return "https://download.pytorch.org/whl/cpu"

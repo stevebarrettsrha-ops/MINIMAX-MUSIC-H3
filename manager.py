@@ -223,10 +223,11 @@ def _probe_torch(python: str, fresh: bool = False) -> dict:
 
 def _probe_torch_now(python: str) -> dict:
     code = ("import torch,json;"
-            "print(json.dumps({'v':torch.__version__,"
-            "'cuda':torch.cuda.is_available(),"
-            "'dev':(torch.cuda.get_device_name(0) if torch.cuda.is_available() "
-            "else '')}))")
+            "ok=torch.cuda.is_available();"
+            "print(json.dumps({'v':torch.__version__,'cuda':ok,"
+            "'cu':torch.version.cuda or '',"
+            "'cap':(list(torch.cuda.get_device_capability(0)) if ok else []),"
+            "'dev':(torch.cuda.get_device_name(0) if ok else '')}))")
     try:
         out = subprocess.run([python, "-c", code], capture_output=True,
                              text=True, timeout=90)
@@ -240,7 +241,21 @@ def _probe_torch_now(python: str) -> dict:
     except Exception:
         return {"state": "unknown", "detail": out.stdout[-160:]}
     if d["cuda"]:
-        return {"state": "ok", "detail": f"torch {d['v']} — GPU: {d['dev']}"}
+        detail = f"torch {d['v']} — GPU: {d['dev']}"
+        try:
+            cu_major = int(str(d.get("cu") or "0").split(".")[0])
+        except ValueError:
+            cu_major = 0
+        # ComfyUI disables its CUDA kernels (the int8 ones Music 3's 8 GB
+        # files use) below CUDA 13 on RTX 20-series and newer (sm 7.5+).
+        if d.get("cap") and tuple(d["cap"]) >= (7, 5) and 0 < cu_major < 13:
+            return {"state": "warn",
+                    "detail": detail + f". This PyTorch is built for CUDA "
+                              f"{d['cu']}; ComfyUI needs CUDA 13.0 or newer on "
+                              "this card for its fast int8 path. Pick "
+                              "'NVIDIA — CUDA 13.0' below and reinstall "
+                              "(needs an NVIDIA driver from 2025 or later)."}
+        return {"state": "ok", "detail": detail}
     return {"state": "warn",
             "detail": f"torch {d['v']} — no GPU detected, songs will be slow."}
 

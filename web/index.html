@@ -678,13 +678,13 @@
       <div class="panel">
         <h2>PyTorch build</h2>
         <p class="sub">Chosen from your hardware. Change it if PyTorch will not install
-          or your GPU is being ignored. An RTX 40-series card wants CUDA 12.8 or 12.4.</p>
+          or your GPU is being ignored. Current ComfyUI needs CUDA 13.0 on RTX 20-series and newer cards, which in turn needs an up-to-date NVIDIA driver.</p>
         <div class="frow">
           <select id="torchIndex">
             <option value="">Automatic</option>
-            <option value="https://download.pytorch.org/whl/cu128">NVIDIA — CUDA 12.8</option>
-            <option value="https://download.pytorch.org/whl/cu124">NVIDIA — CUDA 12.4</option>
-            <option value="https://download.pytorch.org/whl/cu121">NVIDIA — CUDA 12.1</option>
+            <option value="https://download.pytorch.org/whl/cu130">NVIDIA — CUDA 13.0 (RTX 20-series and newer)</option>
+            <option value="https://download.pytorch.org/whl/cu128">NVIDIA — CUDA 12.8 (older driver)</option>
+            <option value="https://download.pytorch.org/whl/cu126">NVIDIA — CUDA 12.6 (GTX 10-series and older)</option>
             <option value="https://download.pytorch.org/whl/rocm6.2">AMD — ROCm 6.2</option>
             <option value="https://download.pytorch.org/whl/cpu">CPU only</option>
           </select>

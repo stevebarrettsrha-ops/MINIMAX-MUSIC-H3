@@ -64,6 +64,12 @@ decode** on. What to expect:
   the same time. Share one ComfyUI between the two apps instead (see setup).
 - **A local song writer shares the card too.** Use a small model (3–4B) in
   Ollama; M3 Studio asks Ollama to unload it after every write.
+- **PyTorch must be built for CUDA 13.0.** Current ComfyUI switches off its
+  CUDA kernels, including the int8 ones the 8 GB files use, on RTX 20-series
+  and newer cards when PyTorch is older than cu130. A fresh install picks
+  cu130 automatically; update the NVIDIA driver first if it refuses. The
+  Engine page's PyTorch row warns when an existing install, YuE Studio's
+  included, is on an older build.
 - **Don't download the bf16 text encoder** (16.7 GB). It is offered on the
   Models page for 24 GB cards only.
 - If a song fails with *out of memory*, the job card says what to change. It
