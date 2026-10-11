@@ -480,14 +480,25 @@ class ComfyClient:
                                                      or DEFAULTS["overlap"])}
         g[N_DECODE] = self._node(decode_class, decode_wanted)
 
-        # Always lossless unless asked otherwise. ComfyUI writes flac, mp3 or
-        # opus and no wav at all, so a wav is made from the flac afterwards.
+        fmt = self._save(g, [N_DECODE, 0], p.get("format"), p.get("quality"))
+
+        return {"prompt": g, "seed": seed, "dit": dit, "te": te, "vae": vae,
+                "decode": decode_class, "duration": duration,
+                "lyrics_sent": lyrics, "format": fmt}
+
+    def _save(self, g: dict, audio, fmt, quality=None) -> str:
+        """The save node at N_SAVE, writing `audio` in `fmt`. Returns the
+        format actually asked for.
+
+        Always lossless unless asked otherwise. ComfyUI writes flac, mp3 or
+        opus and no wav at all, so a wav is made from the flac afterwards.
+        """
         save_class = self.save_node()
-        fmt = p.get("format") or "flac"
+        fmt = fmt or "flac"
         if fmt not in self.save_formats():
             fmt = "flac"
         save_wanted = {
-            "audio": {"names": ["audio"], "value": [N_DECODE, 0], "required": True},
+            "audio": {"names": ["audio"], "value": audio, "required": True},
             "prefix": {"names": ["filename_prefix"], "value": "audio/M3Studio"},
         }
         if save_class == "SaveAudioAdvanced":
@@ -502,15 +513,66 @@ class ComfyClient:
             # does not have is ignored, a missing one fails validation.
             save_spec = self.node_inputs("SaveAudioAdvanced")
             extras = self._format_extras(save_spec.get("format"), fmt)
-            if "quality" in extras and p.get("quality"):
-                extras["quality"] = p["quality"]
+            if "quality" in extras and quality:
+                extras["quality"] = quality
             for name, value in extras.items():
                 g[N_SAVE]["inputs"][name] = value
                 g[N_SAVE]["inputs"]["format." + name] = value
+        return fmt
 
-        return {"prompt": g, "seed": seed, "dit": dit, "te": te, "vae": vae,
-                "decode": decode_class, "duration": duration,
-                "lyrics_sent": lyrics, "format": fmt}
+    # ------------------------------------------------------------------ #
+    # joining the parts of a long song
+    # ------------------------------------------------------------------ #
+    JOIN_NODES = ("LoadAudio", "AudioConcat")
+
+    def can_join(self) -> bool:
+        """Whether this engine can join audio files itself. The join is done
+        with ffmpeg when there is one (it crossfades); this is the way
+        without, so a long song never depends on ffmpeg being installed."""
+        schema = self.schema()
+        return all(n in schema for n in self.JOIN_NODES)
+
+    def build_join_prompt(self, names: list[str], fmt=None, quality=None) -> dict:
+        """LoadAudio for each part, AudioConcat chained in order, then save.
+
+        `names` are files already in ComfyUI's input folder (upload_path).
+        """
+        if not self.can_join():
+            raise ComfyError("This ComfyUI has no AudioConcat node to join the "
+                             "parts of a long song with. Install ffmpeg from "
+                             "the Engine page, or update ComfyUI.")
+        if not names:
+            raise ComfyError("Nothing to join.")
+        g: dict = {}
+        for i, name in enumerate(names):
+            g[f"l{i}"] = self._node("LoadAudio", {
+                "audio": {"names": ["audio"], "value": name, "required": True}})
+        link = ["l0", 0]
+        for i in range(1, len(names)):
+            g[f"c{i}"] = self._node("AudioConcat", {
+                "a": {"names": ["audio1"], "value": link, "required": True},
+                "b": {"names": ["audio2"], "value": [f"l{i}", 0], "required": True},
+                "direction": {"names": ["direction"], "value": "after"},
+            })
+            link = [f"c{i}", 0]
+        used = self._save(g, link, fmt, quality)
+        return {"prompt": g, "format": used}
+
+    def upload_path(self, path, filename: str) -> str:
+        """Send a file M3 Studio keeps to ComfyUI's input folder, and return
+        the name LoadAudio takes."""
+        import mimetypes
+        mime = mimetypes.guess_type(filename)[0] or "audio/flac"
+        with open(path, "rb") as fh:
+            files = {"image": (filename, fh, mime)}
+            r = requests.post(f"{self.url}/upload/image", files=files,
+                              data={"type": "input", "overwrite": "true"},
+                              timeout=600)
+        r.raise_for_status()
+        data = r.json()
+        name = data.get("name") or filename
+        sub = data.get("subfolder") or ""
+        return f"{sub}/{name}" if sub else name
 
     def _clip_type(self, spec) -> str:
         options = self.combo_options(spec)

@@ -562,7 +562,7 @@
               <button data-v="instrumental">None</button>
             </div></div></div>
 
-          <div class="orow"><span class="lab" title="The longest the song may run. The model ends the song when the song ends, so this is a ceiling — a song that reaches it is cut off. Render time grows with length.">Length <i class="hint">i</i></span>
+          <div class="orow"><span class="lab" title="The longest the song may run. The model ends the song when the song ends, so this is a ceiling — a song that reaches it is cut off. Past 6:00 (the most the model writes in one pass) the song is made in parts, one after another, and joined. Render time grows with length.">Length <i class="hint">i</i></span>
             <div class="ctl"><select id="duration"></select></div></div>
 
           <div class="orow"><span class="lab" title="How closely the song follows the caption and lyrics (the text encoder's cfg_scale). Higher is more literal, lower is freer. The official workflow uses 1.7.">Style strength <i class="hint">i</i></span>
@@ -963,54 +963,96 @@ const CAPTION_TEMPLATE =
    Music 3 reads the caption as prose, but a line of tags at its end is still
    read, and it is the fastest way to steer a short caption. Every tag lives on
    one "Tags:" line, so pressing a chip again finds and removes exactly it. */
-const BASE_TAGS = ["upbeat","melancholic","dreamy","energetic","dark","romantic",
-  "female vocal","male vocal","duet","choir","rap verse","instrumental break",
-  "acoustic guitar","electric guitar","piano","Rhodes","synth pads","808 bass",
-  "strings","brass section","live drums","drum machine","70 BPM","90 BPM",
-  "120 BPM","140 BPM","lo-fi texture","wide stereo","vintage tape warmth"];
+const BASE_TAGS = ["reggae","roots reggae","dancehall","afrobeats","amapiano",
+  "gospel","soul","R&B ballad","contemporary pop","hip hop","trap","lo-fi","jazz",
+  "blues","rock","orchestral","synthwave","folk","country","house","drum and bass",
+  "ska","calypso","upbeat","melancholic","dreamy","energetic","dark","romantic",
+  "female vocal","male vocal","duet","choir","rap verse","spoken word",
+  "instrumental break","acoustic guitar","electric guitar","piano","Rhodes",
+  "synth pads","808 bass","strings","brass section","horn section","steel drums",
+  "nyabinghi drums","Hammond organ","live drums","drum machine","68 BPM","74 BPM",
+  "90 BPM","120 BPM","140 BPM","lo-fi texture","wide stereo","vintage tape warmth",
+  "English","Patois","Spanish","Hebrew","Chinese","Korean","Japanese"];
+/* Genres by family, for Explore genres and the tag row. The families are
+   the ones YuE Studio uses, with the Caribbean, African and world genres kept
+   whole, plus a few Music 3 is strong in (its demo covers C-pop, cinematic
+   orchestral and musical theatre). A genre is simply words in the caption. */
 const GENRE_FAMILIES = [
   { name:"Pop", blurb:"Big hooks and clean production, from bubblegum to art pop.", genres:[
-    "Art Pop", "City Pop", "Dance-Pop", "Dream Pop", "Electropop", "Hyperpop",
+    "Arabic Pop", "Art Pop", "Boy Band", "Cantopop", "City Pop", "Dance-Pop",
+    "Dream Pop", "Easy Listening", "Electropop", "Emo-Pop", "Hyperpop",
     "Indie Pop", "J-Pop", "K-Pop", "Latin Pop", "Mandopop", "Synth-Pop"] },
   { name:"Rock", blurb:"Guitars first — from the 1950s to the post-rock long form.", genres:[
-    "Alternative Rock", "Britpop", "Garage Rock", "Grunge", "Hard Rock",
-    "Indie Rock", "Pop Rock", "Post-Punk", "Post-Rock", "Progressive Rock",
-    "Psychedelic Rock", "Shoegaze", "Soft Rock", "Surf Rock"] },
-  { name:"Punk & Metal", blurb:"Fast, loud and heavy.", genres:[
-    "Pop Punk", "Punk Rock", "Emo", "Metalcore", "Nu Metal", "Power Metal",
-    "Symphonic Metal", "Thrash Metal", "Doom Metal"] },
+    "Alternative Rock", "Britpop", "Celtic Rock", "Christian Rock", "Country Rock",
+    "Funk Rock", "Garage Rock", "Grunge", "Hard Rock", "Heartland Rock",
+    "Indie Rock", "Jazz-Rock", "Math Rock", "New Wave", "Pop Rock", "Post-Punk",
+    "Post-Rock", "Progressive Rock", "Psychedelic Rock", "Rock & Roll",
+    "Rockabilly", "Shoegaze", "Soft Rock", "Surf Rock"] },
+  { name:"Punk & Emo", blurb:"Fast, loud, confessional.", genres:[
+    "Dance-Punk", "Emo", "Hardcore Punk", "Pop Punk", "Punk Rock", "Ska Punk"] },
+  { name:"Metal", blurb:"Distortion, weight and speed.", genres:[
+    "Black Metal", "Cyber Metal", "Death Metal", "Doom Metal", "Glam Metal",
+    "Industrial Metal", "Metal", "Metalcore", "Nu Metal", "Power Metal",
+    "Rap Metal", "Symphonic Metal", "Thrash Metal"] },
   { name:"Hip Hop", blurb:"Rhymes over beats, from boom bap to drill.", genres:[
-    "Boom Bap", "Cloud Rap", "Drill", "G-Funk", "Grime", "Lo-Fi Hip Hop",
-    "Phonk", "Trap"] },
+    "Afro Trap", "Boom Bap", "Cloud Rap", "Conscious Hip Hop", "Drill", "Emo Rap",
+    "G-Funk", "Grime", "Industrial Hip Hop", "Lo-Fi Hip Hop", "Phonk", "Trap"] },
   { name:"R&B & Soul", blurb:"Voice-led grooves, church roots to late-night slow jams.", genres:[
-    "Alternative R&B", "Contemporary R&B", "Gospel", "Motown", "Neo-Soul",
-    "New Jack Swing", "Quiet Storm", "Soul", "Trap Soul"] },
+    "Alternative R&B", "Barbershop", "Contemporary R&B", "Doo-Wop", "Motown",
+    "Neo-Soul", "New Jack Swing", "Northern Soul", "Philly Soul", "Quiet Storm",
+    "R&B", "Soul", "Southern Soul", "Trap Soul"] },
   { name:"Funk & Disco", blurb:"Syncopated bass and four-on-the-floor.", genres:[
-    "Disco", "Electro Swing", "Funk", "Italo-Disco", "Nu-Disco"] },
+    "Disco", "Electro Swing", "Eurobeat", "Eurodance", "Funk", "Hi-NRG",
+    "Italo-Disco", "Jazz-Funk", "Nu-Disco"] },
   { name:"Electronic", blurb:"Synths and drum machines, dance floor to headphones.", genres:[
-    "Afro House", "Breakbeat", "Deep House", "Drum and Bass", "Dubstep",
-    "Future Bass", "Hardstyle", "Synthwave", "Tech House", "Techno", "Trance",
-    "UK Garage"] },
+    "Afro House", "Alternative Dance", "Big Room", "Breakbeat", "Chiptune",
+    "Deep House", "Dubstep", "Electronic Dance Music", "Folktronica", "Footwork",
+    "Future Bass", "Hardstyle", "IDM", "Jersey Club", "Jungle",
+    "Liquid Drum and Bass", "Minimal Techno", "Moombahton", "Neurofunk",
+    "Progressive House", "Psytrance", "Synthwave", "Tech House", "Techno",
+    "Trance", "Tropical House", "UK Garage", "Vaporwave"] },
   { name:"Chill & Ambient", blurb:"Slow, spacious and textural.", genres:[
-    "Ambient", "Chillout", "Chillwave", "Downtempo", "Lounge", "Trip Hop"] },
-  { name:"Jazz & Blues", blurb:"Swing, improvisation and bent notes.", genres:[
-    "Bebop", "Big Band", "Bossa Nova", "Cool Jazz", "Smooth Jazz", "Swing",
-    "Delta Blues", "Chicago Blues", "Soul Blues"] },
+    "Ambient", "Chillout", "Chillwave", "Dark Ambient", "Downtempo", "Lounge",
+    "New Age", "Trip Hop"] },
+  { name:"Jazz", blurb:"Swing, improvisation and extended chords.", genres:[
+    "Acid Jazz", "Afro-Jazz", "Bebop", "Big Band", "Cool Jazz", "Dixieland",
+    "Ethio-Jazz", "Free Jazz", "Gypsy Jazz", "Hard Bop", "Latin Jazz",
+    "Smooth Jazz", "Swing"] },
+  { name:"Blues", blurb:"Twelve bars and bent notes.", genres:[
+    "Boogie Woogie", "Chicago Blues", "Delta Blues", "Jump Blues", "Soul Blues",
+    "Texas Blues"] },
   { name:"Country & Folk", blurb:"Story songs, twang and acoustic strings.", genres:[
-    "Americana", "Bluegrass", "Country Pop", "Honky Tonk", "Indie Folk",
-    "Outlaw Country", "Sea Shanty"] },
-  { name:"Latin & Caribbean", blurb:"Clave, dembow and offbeats.", genres:[
-    "Bachata", "Cumbia", "Reggaetón", "Salsa", "Samba", "Tango", "Reggae",
-    "Dancehall", "Afrobeats", "Amapiano"] },
+    "Americana", "Bluegrass", "Cajun", "Country Gospel", "Country Pop",
+    "Honky Tonk", "Indie Folk", "Outlaw Country", "Sea Shanty", "Western Swing",
+    "Zydeco"] },
+  { name:"Reggae & Dancehall", blurb:"One drop, skank and sound-system bass.", genres:[
+    "Reggae", "Roots Reggae", "Dub", "Dancehall", "Lovers Rock", "Rocksteady",
+    "Ska", "Reggae Fusion", "Reggaetón", "Nyabinghi", "Ragga", "Soca", "Calypso"] },
+  { name:"African", blurb:"Log drums, highlife guitar and polyrhythm.", genres:[
+    "Afrobeat", "Afrobeats", "Amapiano", "Afro House", "Afro-Pop", "Highlife",
+    "Juju", "Kwaito", "Gqom", "Bongo Flava", "Coupé-Décalé", "Soukous",
+    "Mbalax", "Kizomba", "Zouk", "Gnawa"] },
+  { name:"Latin", blurb:"Clave, dembow and Latin percussion.", genres:[
+    "Bachata", "Banda", "Bolero", "Bossa Nova", "Corridos", "Cumbia", "Dembow",
+    "Mambo", "Mariachi", "Merengue", "Norteño", "Salsa", "Samba", "Son Cubano",
+    "Tango", "Tejano", "Baile Funk", "Funk Carioca"] },
   { name:"World", blurb:"Traditions from everywhere else.", genres:[
-    "Bhangra", "Bollywood", "Chanson", "Enka", "Fado", "Flamenco", "C-Pop Ballad",
-    "Chinese Folk"] },
-  { name:"Cinematic & Stage", blurb:"Orchestras, opera and the theatre.", genres:[
-    "Film Score", "Epic Orchestral", "Musical Theatre", "Opera", "Video Game Music"] }
+    "Bhangra", "Bollywood", "Chanson", "Enka", "Fado", "Flamenco", "Klezmer",
+    "Polka", "Qawwali", "Schlager", "C-Pop Ballad", "Chinese Folk", "Celtic Folk",
+    "Balkan Brass", "Arabic Pop", "Turkish Pop", "Greek Laïko"] },
+  { name:"Faith", blurb:"Gospel, hymns and worship.", genres:[
+    "Contemporary Christian", "Gospel", "Gregorian Chant", "Worship",
+    "Rastafarian Chant"] },
+  { name:"Classical & Stage", blurb:"Orchestras, opera and the theatre.", genres:[
+    "Baroque", "Classical Music", "Film Score", "Epic Orchestral",
+    "Musical Theatre", "Opera", "Video Game Music"] },
+  { name:"Fun & Kids", blurb:"Songs for laughing and for bedtime.", genres:[
+    "Children's Music", "Comedy", "Lullaby"] }
 ];
 const GENRES = GENRE_FAMILIES.reduce((all, f) => all.concat(f.genres), [])
   .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-const ALL_TAGS = BASE_TAGS.concat(GENRES);
+const ALL_TAGS = BASE_TAGS.concat(GENRES.filter((g) =>
+  !BASE_TAGS.some((t) => t.toLowerCase() === g.toLowerCase())));
 let chipPool = BASE_TAGS.slice(0, 18);
 /* Tags are words in the caption, comma-separated, the way a free-form
    caption is written ("haunting roots reggae, minor key, 68 BPM"). The model
@@ -1185,18 +1227,27 @@ function modelHint(role, name) {
    written, but the encoder reserves memory for the whole ceiling (about
    1 GB per two minutes on the card), so it is the lyrics plus headroom,
    never simply the 6:00 maximum. */
+/* The same arithmetic as parts.estimate_seconds on the server (keep them
+   together): ~4 s a sung line, ~12 s an instrumental section, a third
+   again for the intros, turnarounds and endings the words do not show.
+   Past one pass of the engine (6:00) the song is made in parts. */
 const INSTRUMENTAL_TAG = /^\s*\[(intro|outro|instrumental|solo|interlude|break)[^\]]*\]\s*$/i;
+const MAX_SONG = 1800;
 function lyricsSeconds(text, instrumental) {
   const lines = (text || "").split("\n").map((l) => l.trim()).filter(Boolean);
   const tags = lines.filter((l) => /^\[[^\]]+\]$/.test(l));
   const sung = instrumental ? 0 : lines.length - tags.length;
   const breaks = tags.filter((l) => INSTRUMENTAL_TAG.test(l)).length;
   if (!sung && !tags.length) return 120;
-  // ~4 s a sung line, ~12 s an instrumental section, a third again for
-  // the intros, turnarounds and endings the words do not show.
   const est = (sung * 4 + breaks * 12 + Math.max(0, tags.length - breaks) * 3) * 1.35;
-  const limit = (S.status && S.status.max_duration) || 360;
-  return Math.max(60, Math.min(limit, Math.ceil(est / 30) * 30));
+  const top = (S.status && S.status.max_song) || MAX_SONG;
+  return Math.max(60, Math.min(top, Math.ceil(est / 30) * 30));
+}
+function passLimit() { return (S.status && S.status.max_duration) || 360; }
+function partsFor(seconds) { return Math.max(1, Math.ceil(seconds / passLimit())); }
+function partsNote(seconds) {
+  const n = partsFor(seconds);
+  return n > 1 ? " · " + n + " parts" : "";
 }
 function recommended() {
   return lyricsSeconds($("lyrics").value, segGet("segVocal") === "instrumental");
@@ -1341,7 +1392,9 @@ function viewSong(t) {
   S.viewing = t;
   $("viewTitle").textContent = t.title;
   const facts = [
-    ["Length", fmtTime(t.seconds || 0) + (t.cut ? " — cut at its limit" : "")],
+    ["Length", fmtTime(t.seconds || 0) + (t.cut ? " — cut at its limit" : "")
+      + ((t.parts || []).length ? " · " + t.parts.length + " parts ("
+        + t.parts.map((p) => fmtTime(p.seconds || 0) + (p.cut ? " cut" : "")).join(", ") + ")" : "")],
     ["Seed", t.seed],
     ["Models", [t.dit, t.te].filter(Boolean).join(" + ") || "—"],
     ["Style strength · Variety · Detail",
@@ -1401,6 +1454,7 @@ function renderJobs() {
     d.className = "job" + (j.status === "error" ? " bad" : "");
     const pct = Math.round(j.pct || 0);
     const took = j.elapsed ? " · " + fmtTime(j.elapsed) : "";
+    if (j.parts > 1 && !/^Part \d/.test(j.stage || "")) j.stage = (j.stage || "") + " · " + j.parts + " parts";
     d.innerHTML = '<div class="t"><span>' + esc(j.title || "New song") + "</span><span>" +
       (j.status === "error" ? "failed" : pct + "%") + "</span></div>" +
       '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
@@ -2236,17 +2290,22 @@ async function refreshStatus() {
 }
 /* Real song lengths rather than a slider of seconds. Auto is the engine's own
    default — not its ceiling, because render time grows with the length. */
+/* Real song lengths. Up to the engine's single pass they are one render;
+   past it the song is made in parts and joined, which the label says. */
 function fillDurations(limit) {
   const sel = $("duration");
   const keep = sel.value || store("m3.duration") || "auto";
   const want = ["auto"];
   [30, 60, 90, 120, 150, 180, 210, 240, 300, 360].forEach((s) => { if (s <= limit) want.push(String(s)); });
+  const canJoin = !S.status || S.status.can_join !== false;
+  if (canJoin) [420, 480, 540, 600, 720, 900, 1200, 1800].forEach((s) => want.push(String(s)));
   const have = [...sel.options].map((o) => o.value);
   if (have.join() !== want.join()) {
     sel.innerHTML = "";
     want.forEach((v) => {
       const o = document.createElement("option"); o.value = v;
-      o.textContent = v === "auto" ? "Auto — fits the lyrics" : fmtTime(Number(v));
+      o.textContent = v === "auto" ? "Auto — fits the lyrics"
+        : fmtTime(Number(v)) + partsNote(Number(v));
       sel.appendChild(o);
     });
   }
@@ -2257,7 +2316,8 @@ function fillDurations(limit) {
    with every line of lyrics. */
 function autoNote() {
   const o = $("duration").options[0];
-  if (o) o.textContent = "Auto — " + fmtTime(recommended()) + " for these lyrics";
+  if (o) o.textContent = "Auto — " + fmtTime(recommended()) + " for these lyrics"
+    + partsNote(recommended());
 }
 function fill(sel, values, preferred) {
   const keep = sel.value; sel.innerHTML = "";

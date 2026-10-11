@@ -73,8 +73,19 @@ carry over were learned there the hard way, so keep them.
   top_k 50; tiled decode 1536/64; one seed drives both passes.
 - **Length is a ceiling.** `max_duration` (≤ 360 s, read from the schema)
   bounds the encoder; the encoder's `seconds` output sizes the latent. A song
-  as long as its limit is marked `cut`. Auto is the node's default (120 s),
-  not its ceiling.
+  as long as its limit is marked `cut`. Auto is sized to the lyrics
+  (`parts.estimate_seconds`), never the ceiling: the encoder reserves its
+  KV cache for the whole ceiling (~1 GB per two minutes on the card).
+- **Past one pass, a song is parts.** `parts.plan()` cuts the lyrics at
+  section boundaries into as few parts as the engine's limit allows, each
+  with its own ceiling; `build_parts()` builds every pass up front (so a
+  bad option fails at the Create click), on seeds `base + 1000·(i−1)`;
+  `run_job` renders them in order and joins them — ffmpeg `acrossfade`
+  when there is one (`M3_STUDIO_NO_FFMPEG=1` forces the other route for
+  tests), else ComfyUI's LoadAudio → AudioConcat → save, with the parts
+  uploaded to its input folder. A part that hits its ceiling marks the
+  whole song `cut`. The page's `lyricsSeconds()` is the same arithmetic as
+  `parts.estimate_seconds()`: change both or neither.
 - **Voice is words.** The Vocal buttons add a line to the caption unless the
   caption already says it. An instrumental sends only the lyrics' section
   tags (or `[Intro] [Instrumental] [Outro]`), never the words.

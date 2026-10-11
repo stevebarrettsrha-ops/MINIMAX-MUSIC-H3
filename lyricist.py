@@ -338,7 +338,7 @@ def clean_request(body: dict) -> dict:
         "title": text("title", 120),
         "language": text("language", 60) or "English",
         "vocal": vocal if vocal in ("male", "female", "duet", "instrumental") else "",
-        "duration": TYPICAL_SECONDS if auto else max(10, min(duration, 360)),
+        "duration": TYPICAL_SECONDS if auto else max(10, min(duration, 1800)),
         "auto": auto,
     }
 

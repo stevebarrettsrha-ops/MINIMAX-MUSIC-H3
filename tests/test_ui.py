@@ -58,9 +58,11 @@ def run() -> Suite:
         basic = next(ln for ln in page.input_value("#caption").split("\n")
                      if ln.startswith("Basic Attributes:"))
         tag2 = page.eval_on_selector("#styleChips .chip >> nth=1", "b => b.textContent")
+        gone = (", " + tag + ",") not in basic and not basic.endswith(", " + tag + ".")
         s.check("pressing it again takes only that tag out, commas intact",
-                tag not in basic and basic.endswith(", " + tag2 + ".")
-                and ",," not in basic, basic)
+                gone and basic.endswith(", " + tag2 + ".") and ",," not in basic
+                and "on" not in page.get_attribute("#styleChips .chip >> nth=0", "class"),
+                basic)
         page.fill("#caption", "haunting roots reggae, minor key, 68 BPM")
         page.click("#styleChips .chip >> nth=2")
         tag3 = page.eval_on_selector("#styleChips .chip >> nth=2", "b => b.textContent")
@@ -76,6 +78,13 @@ def run() -> Suite:
                 210 <= est <= 300, str(est))
         s.check("Auto length for no lyrics is the node's 2:00",
                 page.evaluate("lyricsSeconds('', false)") == 120)
+        opts = page.eval_on_selector_all("#duration option", "o => o.map(x => x.textContent)")
+        s.check("lengths past one pass are offered, labelled with their parts",
+                any(o.startswith("10:00") and "2 parts" in o for o in opts)
+                and any(o.startswith("30:00") and "5 parts" in o for o in opts), str(opts[-6:]))
+        big = page.evaluate("lyricsSeconds(('[Verse]\\n' + 'la\\n'.repeat(12) + '[Chorus]\\n' "
+                            "+ 'oh\\n'.repeat(6)).repeat(8), false)")
+        s.check("Auto length runs past 6:00 for a long lyric sheet", big > 360, str(big))
         s.check("the Auto option says what it asks for",
                 "for these lyrics" in page.eval_on_selector("#duration option", "o => o.textContent"))
         page.fill("#lyrics", "Sun on the water")

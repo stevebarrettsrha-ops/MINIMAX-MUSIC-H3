@@ -16,7 +16,7 @@ import requests
 NODES = ["UNETLoader", "CLIPLoader", "VAELoader", "KSampler",
          "MiniMaxMusic3TextEncode", "EmptyMiniMaxMusic3LatentAudio",
          "ConditioningZeroOut", "VAEDecodeAudio", "VAEDecodeAudioTiled",
-         "SaveAudioAdvanced", "SaveAudio"]
+         "SaveAudioAdvanced", "SaveAudio", "LoadAudio", "AudioConcat"]
 FILES = {
     ("UNETLoader", "unet_name"): [
         "flux1-dev.safetensors",
@@ -27,6 +27,9 @@ FILES = {
         "t5xxl_fp16.safetensors"],
     ("VAELoader", "vae_name"): [
         "ae.safetensors", "minimax_music3_dav.safetensors"],
+    # LoadAudio lists ComfyUI's input folder, which is empty on a fresh
+    # install: the parts of a long song are uploaded there to be joined.
+    ("LoadAudio", "audio"): [],
 }
 
 

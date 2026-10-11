@@ -11,6 +11,7 @@ import json
 import mimetypes
 import re
 import os
+import random
 import subprocess
 import threading
 import time
@@ -25,6 +26,7 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 import bootstrap
 import comfy
 import lyricist
+import parts
 import manager
 from bootstrap import (ComfyProcess, Progress, clean_url,
                        comfy_online, comfy_port, detect_comfy_dirs,
@@ -198,9 +200,9 @@ def clean_generate(body: dict) -> dict:
         "instrumental": as_bool(body.get("instrumental")),
         "tiled_decode": as_bool(body.get("tiled_decode"), True),
         "count": as_int(body.get("count"), 1, 1, 4),
-        # The engine's own ceiling (360 s) is applied when the graph is built;
-        # this is only here to stop a nonsense number getting that far.
-        "duration": as_int(body.get("duration"), 120, 1, 3600),
+        # Past the engine's single pass (360 s) the song is made in parts;
+        # parts.MAX_SONG is the most the planner will take on.
+        "duration": as_int(body.get("duration"), 120, 1, parts.MAX_SONG),
         "steps": as_int(body.get("steps"), 30, 1, 200),
         "top_k": as_int(body.get("top_k"), 50, 1, 16384),
         "tile_size": as_int(body.get("tile_size"), 1536, 32, 8192),
@@ -579,7 +581,219 @@ def ran_out(built: dict, seconds: float | None) -> bool:
     return bool(seconds and limit and seconds >= limit - 1.0)
 
 
-def run_job(job_id: str, params: dict, built: dict | None = None) -> None:
+class JobStopped(Exception):
+    """The person pressed Stop."""
+
+
+class JobFailed(Exception):
+    """Something a person can act on, worded for the job card."""
+
+
+def build_parts(p: dict) -> list[dict]:
+    """Every pass a song needs, built and validated up front.
+
+    One part when the length fits the engine's single pass; otherwise the
+    lyrics are cut into parts that each do (parts.plan), each with its own
+    caption note and a seed of the same family, so the set can be made again
+    exactly from the first seed.
+    """
+    seed = p.get("seed")
+    seed = int(seed) if seed not in (None, "") else random.randint(0, 2**31 - 1)
+    planned = parts.plan(p.get("lyrics") or "", bool(p.get("instrumental")),
+                         int(p.get("duration") or 120), client.duration_limit())
+    out = []
+    for part in planned:
+        built = client.build_prompt({
+            **p,
+            "caption": parts.part_caption(p.get("caption") or "", part["index"],
+                                          part["count"]),
+            "lyrics": part["lyrics"], "duration": part["seconds"],
+            "seed": seed + 1000 * (part["index"] - 1)})
+        built["index"], built["count"] = part["index"], part["count"]
+        out.append(built)
+    return out
+
+
+def wait_prompt(job_id: str, prompt_id: str, set_state, label: str,
+                low: float, high: float) -> tuple[list[dict], float]:
+    """Follow one prompt to its outputs. Progress is mapped into [low, high]
+    of the job's bar. Raises JobStopped or JobFailed."""
+    def scale(p: float) -> float:
+        return round(low + (max(6.0, min(p, 94.0)) - 6.0) / 88.0 * (high - low), 1)
+
+    # queued_at is when ComfyUI took it; run_since is when ComfyUI began it.
+    # They differ by however long the songs ahead of it take, which is time
+    # this song must not be charged for.
+    queued_at = time.time()
+    run_since = 0.0
+    last_move = queued_at
+    moved = None
+    unreachable_since = 0.0
+    while True:
+        time.sleep(1.5)
+        # Read the flag under the lock and act outside it: jobs_lock is a
+        # plain Lock, so calling set_state() while holding it would wedge
+        # this thread and every /api/jobs request behind it.
+        with jobs_lock:
+            cancelled = bool(jobs[job_id].get("cancelled"))
+        if cancelled:
+            client.stop(prompt_id)
+            raise JobStopped()
+
+        # One history read answers both questions, and a ComfyUI that blinks
+        # — a restart, a moment of load — must not throw away a song that is
+        # still sitting in its queue.
+        try:
+            hist = client.history(prompt_id)
+        except requests.RequestException:
+            unreachable_since = unreachable_since or time.time()
+            if time.time() - unreachable_since > 120:
+                raise JobFailed("ComfyUI stopped answering. Check the engine on "
+                                "the Engine page, then make the song again.")
+            set_state(stage=label + "Waiting for ComfyUI to answer")
+            continue
+        if unreachable_since:
+            unreachable_since = 0.0
+            # ComfyUI does not keep its queue over a restart, so a prompt it
+            # no longer knows about is never going to finish.
+            if not hist and not client.in_queue(prompt_id):
+                raise JobFailed("ComfyUI restarted, and the song it was working "
+                                "on went with its queue. Press Create to make "
+                                "it again.")
+
+        err = client.failed(prompt_id, hist)
+        if err:
+            raise JobFailed(err)
+
+        outs = client.outputs(prompt_id, hist)
+        if outs:
+            return outs, run_since
+
+        wp = ws_progress.get(prompt_id) or {}
+        node = wp.get("node")
+        value, maximum = wp.get("value", 0), wp.get("max", 0)
+
+        # Any of these changing is ComfyUI saying it is still working: the
+        # node it has reached, or the step it is on. Timing a song out on
+        # total elapsed instead killed slow-but-healthy renders, which is
+        # exactly what a big model on a small card looks like.
+        fingerprint = (node, value, maximum)
+        if fingerprint != moved:
+            moved, last_move = fingerprint, time.time()
+        if not run_since and (wp or client.is_running(prompt_id)):
+            run_since = last_move = time.time()
+
+        if not run_since:
+            # Still behind other songs. Nothing is wrong and nothing is owed,
+            # so no clock runs — but a prompt ComfyUI has forgotten is never
+            # going to start either.
+            if (time.time() - queued_at > NEVER_STARTED_LIMIT
+                    and not hist and not client.in_queue(prompt_id)):
+                raise JobFailed("ComfyUI no longer has this song in its queue "
+                                "and never started it. Press Create to make it "
+                                "again.")
+            set_state(pct=scale(5), stage=label + "Waiting for the songs ahead of it",
+                      elapsed=round(time.time() - queued_at))
+            continue
+
+        phase = PHASES.get(str(wp.get("progress_node") or node or ""))
+        if phase and maximum and wp.get("progress_node") == node:
+            stage, lo, hi = phase
+            pct = lo + min(value / maximum, 1.0) * (hi - lo)
+            if node == comfy.N_ENC:
+                # The encoder counts frames against the ceiling it was given;
+                # a song that ends earlier jumps ahead at the end.
+                stage += f" — {value / 25:.0f}s of up to {maximum / 25:.0f}s"
+            else:
+                stage += f" — step {value} of {maximum}"
+        elif str(node) in LOADERS:
+            stage, pct = LOADERS[str(node)], 6
+        elif phase:
+            stage, pct = phase[0], phase[1]
+        else:
+            stage, pct = "Working", 6
+        set_state(pct=scale(pct), stage=label + stage,
+                  elapsed=round(time.time() - run_since))
+
+        quiet = time.time() - last_move
+        if quiet > STALL_LIMIT:
+            ran = int(time.time() - run_since) // 60
+            raise JobFailed(f"ComfyUI reported nothing for {int(quiet) // 60} "
+                            f"minutes, after working for {ran}. The engine's "
+                            "log on the Engine page says what it was doing. A "
+                            "shorter Length is the usual way past a render "
+                            "that will not move on a small card.")
+
+
+def fetch_output(item: dict, dest: Path) -> Path:
+    """Copy one finished file out of ComfyUI into data/tracks."""
+    TRACKS_DIR.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with client.view(item) as resp:
+            resp.raise_for_status()
+            with open(partial, "wb") as fh:
+                for chunk in resp.iter_content(1024 * 256):
+                    if chunk:
+                        fh.write(chunk)
+        if partial.stat().st_size == 0:
+            raise ComfyError("ComfyUI returned an empty audio file.")
+        partial.replace(dest)
+    except Exception:
+        # A dropped connection must not leave something that looks like a
+        # playable track, or an orphan that accumulates forever.
+        partial.unlink(missing_ok=True)
+        raise
+    return dest
+
+
+def output_ext(item: dict) -> str:
+    ext = Path(as_text(item.get("filename"))).suffix.lower()
+    return ext if ext in (".flac", ".mp3", ".opus", ".wav", ".ogg", ".m4a") else ".flac"
+
+
+# Seconds of crossfade between the parts of a long song. Two independent
+# passes never line up bar for bar; a short fade hides the seam where a hard
+# cut would click.
+CROSSFADE = 2.0
+
+
+def join_with_ffmpeg(paths: list[Path], dest: Path) -> bool:
+    """One file from several, crossfaded in order. False when there is no
+    ffmpeg or it could not read the parts."""
+    ffmpeg = bootstrap.find_tool("ffmpeg")
+    if not ffmpeg or os.environ.get("M3_STUDIO_NO_FFMPEG") == "1" or len(paths) < 2:
+        return False
+    shortest = min((audio_duration(p) or CROSSFADE * 4) for p in paths)
+    fade = max(0.1, min(CROSSFADE, shortest / 4))
+    chain, last = [], "[0:a]"
+    for i in range(1, len(paths)):
+        out = f"[a{i}]"
+        chain.append(f"{last}[{i}:a]acrossfade=d={fade:.2f}:c1=tri:c2=tri{out}")
+        last = out
+    cmd = [ffmpeg, "-y", "-loglevel", "error"]
+    for p in paths:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", ";".join(chain), "-map", last, str(dest)]
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and dest.is_file() and dest.stat().st_size > 0
+
+
+def join_in_comfy(job_id: str, paths: list[Path], dest: Path, fmt: str,
+                  set_state, low: float, high: float) -> Path:
+    """The parts handed to ComfyUI and concatenated there (no crossfade)."""
+    names = [client.upload_path(p, p.name) for p in paths]
+    built = client.build_join_prompt(names, fmt)
+    prompt_id = client.queue(built["prompt"])
+    outs, _ = wait_prompt(job_id, prompt_id, set_state, "Joining the parts — ",
+                          low, high)
+    return fetch_output(outs[0], dest.with_suffix(output_ext(outs[0])))
+
+
+def run_job(job_id: str, params: dict, built=None) -> None:
     def set_state(**kw):
         with jobs_lock:
             # Note when it stopped, so the job list can keep it around long
@@ -590,167 +804,65 @@ def run_job(job_id: str, params: dict, built: dict | None = None) -> None:
 
     wanted = (params.get("format") or "flac").lower()
     params = {**params, "format": render_format(wanted)}
-
+    track_id = uuid.uuid4().hex[:12]
+    made: list[dict] = []
     try:
         set_state(stage="Building the graph", pct=2)
         # The API normally builds this before accepting the job, so a missing
         # node or model is reported to the Create click immediately rather
         # than on an asynchronous card. Kept for callers that run a job
         # directly.
-        built = built or client.build_prompt(params)
-        set_state(stage="Queued in ComfyUI", pct=4, seed=built["seed"])
-        prompt_id = client.queue(built["prompt"])
-        set_state(prompt_id=prompt_id, stage="Waiting for ComfyUI", pct=5)
+        if built is None:
+            built = build_parts(params)
+        elif isinstance(built, dict):
+            built = [built]
+        count = len(built)
+        set_state(seed=built[0]["seed"], parts=count)
 
-        # queued_at is when ComfyUI took it; run_since is when ComfyUI began
-        # it. They differ by however long the songs ahead of it take, which is
-        # time this song must not be charged for.
-        queued_at = time.time()
-        run_since = 0.0
-        last_move = queued_at
-        moved = None
-        unreachable_since = 0.0
-        while True:
-            time.sleep(1.5)
-            # Read the flag under the lock and act outside it: jobs_lock is a
-            # plain Lock, so calling set_state() while holding it would wedge
-            # this thread and every /api/jobs request behind it.
-            with jobs_lock:
-                cancelled = bool(jobs[job_id].get("cancelled"))
-            if cancelled:
-                client.stop(prompt_id)
-                set_state(status="cancelled", stage="Cancelled")
-                return
-
-            # One history read answers both questions, and a ComfyUI that
-            # blinks — a restart, a moment of load — must not throw away a song
-            # that is still sitting in its queue.
+        # The bar: parts share 6-90, the join (if any) 90-94, saving after.
+        span = (90.0 if count == 1 else 88.0) - 6.0
+        for i, part in enumerate(built):
+            label = f"Part {i + 1} of {count} — " if count > 1 else ""
+            low, high = 6 + span * i / count, 6 + span * (i + 1) / count
+            set_state(stage=label + "Queued in ComfyUI", pct=round(low, 1))
+            prompt_id = client.queue(part["prompt"])
+            set_state(prompt_id=prompt_id)
             try:
-                hist = client.history(prompt_id)
-            except requests.RequestException:
-                unreachable_since = unreachable_since or time.time()
-                if time.time() - unreachable_since > 120:
-                    set_state(status="error", stage="Failed",
-                              error="ComfyUI stopped answering. Check the "
-                                    "engine on the Engine page, then make the "
-                                    "song again.")
-                    return
-                set_state(stage="Waiting for ComfyUI to answer")
-                continue
-            if unreachable_since:
-                unreachable_since = 0.0
-                # ComfyUI does not keep its queue over a restart, so a prompt
-                # it no longer knows about is never going to finish.
-                if not hist and not client.in_queue(prompt_id):
-                    set_state(status="error", stage="Failed",
-                              error="ComfyUI restarted, and the song it was "
-                                    "working on went with its queue. Press "
-                                    "Create to make it again.")
-                    return
+                outs, run_since = wait_prompt(job_id, prompt_id, set_state,
+                                              label, low, high)
+            except JobFailed as exc:
+                raise JobFailed(explain_failure(
+                    str(exc), int(part.get("duration") or 0), client.vram_total(),
+                    part.get("te", ""), part.get("dit", ""))) from None
+            suffix = f".p{i + 1}" if count > 1 else ""
+            dest = TRACKS_DIR / f"{track_id}{suffix}{output_ext(outs[0])}"
+            path = fetch_output(outs[0], dest)
+            seconds = audio_duration(path)
+            made.append({"index": i + 1, "seed": part["seed"],
+                         "duration": part.get("duration"), "seconds": seconds,
+                         "cut": ran_out(part, seconds), "path": path,
+                         "run_since": run_since})
 
-            err = client.failed(prompt_id, hist)
-            if err:
-                set_state(status="error", stage="Failed",
-                          error=explain_failure(
-                              err, int(built.get("duration") or 0),
-                              client.vram_total(), built.get("te", ""),
-                              built.get("dit", "")))
-                return
-
-            outs = client.outputs(prompt_id, hist)
-            if outs:
-                break
-
-            wp = ws_progress.get(prompt_id) or {}
-            node = wp.get("node")
-            value, maximum = wp.get("value", 0), wp.get("max", 0)
-
-            # Any of these changing is ComfyUI saying it is still working: the
-            # node it has reached, or the step it is on. Timing a song out on
-            # total elapsed instead killed slow-but-healthy renders, which is
-            # exactly what a big model on a small card looks like.
-            fingerprint = (node, value, maximum)
-            if fingerprint != moved:
-                moved, last_move = fingerprint, time.time()
-            if not run_since and (wp or client.is_running(prompt_id)):
-                run_since = last_move = time.time()
-
-            if not run_since:
-                # Still behind other songs. Nothing is wrong and nothing is
-                # owed, so no clock runs — but a prompt ComfyUI has forgotten
-                # is never going to start either.
-                if (time.time() - queued_at > NEVER_STARTED_LIMIT
-                        and not hist and not client.in_queue(prompt_id)):
-                    set_state(status="error", stage="Failed",
-                              error="ComfyUI no longer has this song in its "
-                                    "queue and never started it. Press Create "
-                                    "to make it again.")
-                    return
-                set_state(pct=5, stage="Waiting for the songs ahead of it",
-                          elapsed=round(time.time() - queued_at))
-                continue
-
-            phase = PHASES.get(str(wp.get("progress_node") or node or ""))
-            if phase and maximum and wp.get("progress_node") == node:
-                stage, low, high = phase
-                pct = low + min(value / maximum, 1.0) * (high - low)
-                if node == comfy.N_ENC:
-                    # The encoder counts frames against the ceiling it was
-                    # given; a song that ends earlier jumps ahead at the end.
-                    stage += f" — {value / 25:.0f}s of up to {maximum / 25:.0f}s"
-                else:
-                    stage += f" — step {value} of {maximum}"
-            elif str(node) in LOADERS:
-                stage, pct = LOADERS[str(node)], 6
-            elif phase:
-                stage, pct = phase[0], phase[1]
+        if count > 1:
+            set_state(stage="Joining the parts", pct=90)
+            dest = TRACKS_DIR / f"{track_id}{made[0]['path'].suffix}"
+            if join_with_ffmpeg([m["path"] for m in made], dest):
+                master = dest
             else:
-                stage, pct = "Working", 6
-            set_state(pct=round(pct, 1), stage=stage,
-                      elapsed=round(time.time() - run_since))
-
-            quiet = time.time() - last_move
-            if quiet > STALL_LIMIT:
-                ran = int(time.time() - run_since) // 60
-                set_state(status="error", stage="Timed out",
-                          error=f"ComfyUI reported nothing for "
-                                f"{int(quiet) // 60} minutes, after working "
-                                f"for {ran}. The engine's log on the Engine "
-                                "page says what it was doing. A shorter "
-                                "Length is the usual way past a render that "
-                                "will not move on a small card.")
-                return
+                master = join_in_comfy(job_id, [m["path"] for m in made], dest,
+                                       params["format"], set_state, 90, 94)
+            for m in made:
+                m["path"].unlink(missing_ok=True)
+        else:
+            master = made[0]["path"]
 
         set_state(stage="Saving the track", pct=95)
-        item = outs[0]
-        track_id = uuid.uuid4().hex[:12]
-        ext = Path(as_text(item.get("filename"))).suffix.lower()
-        if ext not in (".flac", ".mp3", ".opus", ".wav", ".ogg", ".m4a"):
-            ext = ".flac"
-        TRACKS_DIR.mkdir(parents=True, exist_ok=True)
-        dest = TRACKS_DIR / f"{track_id}{ext}"
-        partial = dest.with_suffix(dest.suffix + ".part")
-        try:
-            with client.view(item) as resp:
-                resp.raise_for_status()
-                with open(partial, "wb") as fh:
-                    for chunk in resp.iter_content(1024 * 256):
-                        if chunk:
-                            fh.write(chunk)
-            if partial.stat().st_size == 0:
-                raise ComfyError("ComfyUI returned an empty audio file.")
-            partial.replace(dest)
-        except Exception:
-            # A dropped connection must not leave something that looks like a
-            # playable track, or an orphan that accumulates forever.
-            partial.unlink(missing_ok=True)
-            raise
-
         if wanted == "wav":
             set_state(stage="Saving as wav", pct=97)
-        kept = save_as(dest, track_id, wanted)
-
+        kept = save_as(master, track_id, wanted)
         seconds = audio_duration(kept)
+        started = min((m["run_since"] for m in made if m["run_since"]),
+                      default=0) or jobs[job_id]["created"]
         track = {
             "id": track_id,
             "title": track_title(params),
@@ -761,15 +873,17 @@ def run_job(job_id: str, params: dict, built: dict | None = None) -> None:
             "lyrics": params.get("lyrics", ""),
             "instrumental": bool(params.get("instrumental")),
             "vocal": params.get("vocal", ""),
-            "seed": built["seed"],
+            "seed": built[0]["seed"],
             # duration is the ceiling that was asked for and is what "reuse
             # settings" loads back; seconds is how long the song actually came
             # out, and is what gets shown.
-            "duration": built.get("duration"),
+            "duration": params.get("duration"),
             "seconds": seconds,
-            # The song ran into its length limit before it ended, so its
-            # ending is missing. Worth saying: it plays like any other song.
-            "cut": ran_out(built, seconds),
+            # A part that ran into its ceiling is missing its ending, and so
+            # is the song — even when the join hides the seam.
+            "cut": any(m["cut"] for m in made),
+            "parts": [{k: m[k] for k in ("index", "seed", "duration", "seconds",
+                                         "cut")} for m in made] if count > 1 else [],
             # Everything that would make it again (with the same seed).
             "cfg_scale": params.get("cfg_scale"),
             "top_k": params.get("top_k"),
@@ -777,21 +891,30 @@ def run_job(job_id: str, params: dict, built: dict | None = None) -> None:
             "cfg": params.get("cfg"),
             "sampler": params.get("sampler"),
             "scheduler": params.get("scheduler"),
-            "dit": built.get("dit"),
-            "te": built.get("te"),
-            "tiled_decode": built.get("decode") == "VAEDecodeAudioTiled",
+            "dit": built[0].get("dit"),
+            "te": built[0].get("te"),
+            "tiled_decode": built[0].get("decode") == "VAEDecodeAudioTiled",
             "file": kept.name,
             "format": kept.suffix.lstrip(".").lower(),
-            "render_seconds": round(time.time() - (run_since or queued_at)),
+            "render_seconds": round(time.time() - started),
             "created": time.time(),
         }
         add_track(track)
         set_state(status="done", pct=100, stage="Ready", track=track)
-    except ComfyError as exc:
+    except JobStopped:
+        set_state(status="cancelled", stage="Cancelled")
+    except (JobFailed, ComfyError) as exc:
         set_state(status="error", error=str(exc), stage="Failed")
     except Exception as exc:  # noqa: BLE001
         set_state(status="error", error=f"{type(exc).__name__}: {exc}",
                   stage="Failed")
+    finally:
+        with jobs_lock:
+            ended = jobs[job_id].get("status") != "done"
+        if ended:
+            # Parts of a song that was stopped or failed are not a song.
+            for m in made:
+                m["path"].unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -849,6 +972,10 @@ def api_status():
             payload["samplers"], payload["schedulers"] = client.samplers()
             payload["formats"] = available_formats(client.save_formats())
             payload["max_duration"] = client.duration_limit()
+            # Past one pass a song is made in parts and joined: with ffmpeg
+            # (crossfaded) or by the engine itself (a plain concat).
+            payload["can_join"] = bool(bootstrap.find_tool("ffmpeg")) or client.can_join()
+            payload["max_song"] = parts.MAX_SONG
             # What the card holds, and what each model file weighs, so the
             # pickers can say which ones are heavy for this card. A file
             # larger than the card still works — ComfyUI streams it — but it
@@ -1303,7 +1430,7 @@ def api_generate():
     try:
         # A fixed seed with ×3 makes three takes on consecutive seeds, so the
         # set can be made again exactly — not three copies of one song.
-        built_prompts = [client.build_prompt(
+        built_prompts = [build_parts(
             {**render_params, "seed": None if seed is None else seed + i})
             for i in range(count)]
     except ComfyError as exc:
@@ -1326,7 +1453,8 @@ def api_generate():
             jobs[job_id] = {"id": job_id, "status": "running", "pct": 0,
                             "stage": "Starting", "created": time.time(),
                             "title": track_title(params),
-                            "summary": caption_genre(params.get("caption", ""))}
+                            "summary": caption_genre(params.get("caption", "")),
+                            "parts": len(built)}
         threading.Thread(target=run_job, args=(job_id, dict(params), built),
                          daemon=True).start()
         created.append(job_id)

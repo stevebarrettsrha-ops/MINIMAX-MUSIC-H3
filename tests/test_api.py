@@ -121,6 +121,60 @@ def run() -> Suite:
         job = st.wait_job(jid)
         s.check("a song can be stopped", job["status"] == "cancelled", job["status"])
 
+    long_lyrics = "\n\n".join(
+        ["[Intro]"] + [("[Verse]\n" if i % 2 == 0 else "[Chorus]\n")
+                       + "\n".join(f"line {i} {j}" for j in range(8)) for i in range(10)]
+        + ["[Outro]"])
+    for how in ("ffmpeg", "comfy"):
+        env = {"M3_STUDIO_NO_FFMPEG": "1"} if how == "comfy" else {}
+        with Stack(app_env=env) as st:
+            status = st.wait_ready()
+            s.check(f"[{how}] status says long songs can be joined",
+                    status.get("can_join") is True and status.get("max_song") == 1800)
+            r = st.post("/api/generate", {"caption": CAPTION, "lyrics": long_lyrics,
+                                          "duration": 600, "seed": 500})
+            s.check(f"[{how}] a ten-minute song is accepted", r.ok, r.text)
+            jid = r.json()["jobs"][0]
+            stages = set()
+            end = time.time() + 6
+            while time.time() < end:
+                for j in st.get("/api/jobs").json():
+                    if j["id"] == jid:
+                        stages.add(j.get("stage", ""))
+                time.sleep(0.2)
+            job = st.wait_job(jid, timeout=120)
+            s.check(f"[{how}] the parts are announced on the card",
+                    any(x.startswith("Part 1 of 2") for x in stages)
+                    and any(x.startswith("Part 2 of 2") for x in stages), str(stages))
+            s.check(f"[{how}] the song finishes as one track",
+                    job["status"] == "done", json.dumps(job)[:400])
+            track = job.get("track") or {}
+            sent = [x["prompt"] for x in st.prompts()]
+            encs = [g[comfy.N_ENC]["inputs"] for g in sent if comfy.N_ENC in g]
+            s.check(f"[{how}] two passes were rendered, each within one pass",
+                    len(encs) == 2 and all(e["max_duration"] <= 360 for e in encs),
+                    str([e.get("max_duration") for e in encs]))
+            s.check(f"[{how}] the parts share a seed family",
+                    [e["seed"] for e in encs] == [500, 1500], str([e["seed"] for e in encs]))
+            s.check(f"[{how}] each part's caption says which part it is",
+                    "part 1 of 2" in encs[0]["caption"] and "part 2 of 2" in encs[1]["caption"]
+                    and "no intro" in encs[1]["caption"] and "no intro" not in encs[0]["caption"])
+            s.check(f"[{how}] the lyrics were split at sections, nothing lost",
+                    (encs[0]["lyrics"] + "\n\n" + encs[1]["lyrics"]) == long_lyrics)
+            whole = sum((p.get("seconds") or 0) for p in track.get("parts", []))
+            s.check(f"[{how}] the track is the parts joined",
+                    len(track.get("parts", [])) == 2 and whole > 0
+                    and abs((track.get("seconds") or 0) - whole) < 3.0,
+                    f"{track.get('seconds')} vs parts {whole}")
+            joins = [g for g in sent if any(n["class_type"] == "AudioConcat" for n in g.values())]
+            s.check(f"[{how}] the join ran where it should",
+                    (len(joins) == 1) == (how == "comfy"), str(len(joins)))
+            audio = st.get("/api/track/" + track["id"])
+            s.check(f"[{how}] the joined audio is served", audio.ok and len(audio.content) > 100)
+            left = sorted(p.name for p in (st.data / "tracks").iterdir())
+            s.check(f"[{how}] the part files are cleaned up after the join",
+                    not any(".p1." in n or ".p2." in n for n in left), str(left))
+
     with Stack(mock_env={"MOCK_CUT": "1"}) as st:
         st.wait_ready()
         r = st.post("/api/generate", {"caption": CAPTION, "duration": 40})

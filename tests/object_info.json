@@ -1,4 +1,69 @@
 {
+ "AudioConcat": {
+  "api_node": false,
+  "category": "audio",
+  "deprecated": false,
+  "description": "Concatenates the audio1 to audio2 in the specified direction.",
+  "dev_only": false,
+  "display_name": "Concatenate Audio",
+  "essentials_category": null,
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "audio1": [
+     "AUDIO",
+     {}
+    ],
+    "audio2": [
+     "AUDIO",
+     {}
+    ],
+    "direction": [
+     "COMBO",
+     {
+      "default": "after",
+      "multiselect": false,
+      "options": [
+       "after",
+       "before"
+      ],
+      "tooltip": "Whether to append audio2 after or before audio1."
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "audio1",
+    "audio2",
+    "direction"
+   ]
+  },
+  "is_input_list": false,
+  "name": "AudioConcat",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "AUDIO"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "join audio",
+   "combine audio",
+   "append audio"
+  ]
+ },
  "CLIPLoader": {
   "category": "model/loaders",
   "description": "Recipes:\nsd: clip-l\nstable cascade: clip-g\nsd3: t5 xxl / clip-g / clip-l\nstable audio: t5 base\nmochi: t5 xxl\ncogvideox: t5 xxl (226-token padding)\ncosmos: old t5 xxl\nlumina2: gemma 2 2B\nwan: umt5 xxl\nhidream: llama-3.1 (Recommend) or t5\nomnigen2: qwen vl 2.5 3B\njoyimage: qwen3-vl 8B\nlens: gpt-oss-20b\npixeldit: gemma 2 2B elm\nminimax: MiniMax H3 Qwen3-VL or Music3 Qwen/RVQ",
@@ -353,6 +418,57 @@
    "diffuse",
    "txt2img",
    "img2img"
+  ]
+ },
+ "LoadAudio": {
+  "api_node": false,
+  "category": "audio",
+  "deprecated": false,
+  "description": "",
+  "dev_only": false,
+  "display_name": "Load Audio",
+  "essentials_category": "Audio",
+  "experimental": false,
+  "has_intermediate_output": false,
+  "input": {
+   "required": {
+    "audio": [
+     "COMBO",
+     {
+      "audio_upload": true,
+      "multiselect": false,
+      "options": []
+     }
+    ]
+   }
+  },
+  "input_order": {
+   "required": [
+    "audio"
+   ]
+  },
+  "is_input_list": false,
+  "name": "LoadAudio",
+  "output": [
+   "AUDIO"
+  ],
+  "output_is_list": [
+   false
+  ],
+  "output_matchtypes": null,
+  "output_name": [
+   "AUDIO"
+  ],
+  "output_node": false,
+  "output_tooltips": [
+   null
+  ],
+  "price_badge": null,
+  "python_module": "comfy_extras.nodes_audio",
+  "search_aliases": [
+   "import audio",
+   "open audio",
+   "audio file"
   ]
  },
  "MiniMaxMusic3TextEncode": {

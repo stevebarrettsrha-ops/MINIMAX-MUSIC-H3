@@ -53,10 +53,22 @@ decode** on. What to expect:
   audio, so about **16 minutes per minute of music**. The job card shows
   the frames written so far and the elapsed time; the library records how
   long each song took (**Caption and lyrics → Rendered in**).
+- **Songs longer than 6:00 are made in parts.** The model writes at most
+  6:00 (9,000 frames) in one pass; that limit is the model's, not the app's.
+  Past it, M3 Studio cuts the lyrics into parts at section boundaries, each
+  within one pass, renders them one after another with the same caption and
+  a seed family, and joins them into one track (crossfaded with ffmpeg, or
+  concatenated by ComfyUI's own AudioConcat node when there is no ffmpeg).
+  Each part's caption says it is part N of M of one continuous song, with no
+  intro after the first and no ending before the last. That steers the model
+  rather than binds it: the parts are separate performances, and the seams
+  are where to listen. Lengths up to 30:00 are offered; a 10:00 song on an
+  RTX 4060 is about 2¾ hours.
 - **Length is a ceiling, and Auto fits it to the lyrics.** The model ends the
   song when the song ends; a ceiling shorter than the lyrics cuts the last
   sections off (badged **CUT**), which looks like the `[Section]` tags being
-  ignored. Auto reads the lyrics and adds headroom (60 s to 6:00). Time is
+  ignored. Auto reads the lyrics and adds headroom (60 s to 30:00, in parts
+  past 6:00). Time is
   only spent on what is written, but the encoder reserves memory for the
   whole ceiling (about 1 GB per two minutes), so don't set 6:00 for a short
   song.
@@ -151,7 +163,7 @@ Every control maps onto a real node input:
 | Control | Node input | Default |
 |---|---|---|
 | Vocal | words added to the caption (the model takes voice as text) | Any |
-| Length | `MiniMaxMusic3TextEncode.max_duration` (a ceiling) | the node's own default, 2:00 |
+| Length | `MiniMaxMusic3TextEncode.max_duration` (a ceiling); past 6:00, one pass per part | Auto — sized to the lyrics |
 | Style strength | `MiniMaxMusic3TextEncode.cfg_scale` | 1.7 (the official workflow's value) |
 | Variety | `MiniMaxMusic3TextEncode.top_k` | 50 |
 | Detail | `KSampler.steps` | 30 |

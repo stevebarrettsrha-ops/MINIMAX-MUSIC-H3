@@ -81,7 +81,8 @@ class Stack:
     """A mock ComfyUI and an M3 Studio pointed at it, torn down on exit."""
 
     def __init__(self, mock_env: dict | None = None, models: bool = True,
-                 setup_complete: bool = True, config: dict | None = None) -> None:
+                 setup_complete: bool = True, config: dict | None = None,
+                 app_env: dict | None = None) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="m3test-"))
         self.data = self.tmp / "data"
         self.models = self.tmp / "models"
@@ -104,7 +105,8 @@ class Stack:
         (self.data / "config.json").write_text(json.dumps(cfg))
         app_env = {**os.environ, "M3_STUDIO_DATA": str(self.data),
                    "M3_STUDIO_PORT": str(self.app_port),
-                   "M3_STUDIO_NO_BROWSER": "1", "M3_STUDIO_NO_SEARCH": "1"}
+                   "M3_STUDIO_NO_BROWSER": "1", "M3_STUDIO_NO_SEARCH": "1",
+                   **(app_env or {})}
         self.log = open(self.tmp / "server.log", "w")
         self.app = subprocess.Popen([sys.executable, str(ROOT / "server.py")],
                                     env=app_env, stdout=self.log,

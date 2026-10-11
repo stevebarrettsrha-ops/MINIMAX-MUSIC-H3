@@ -27,8 +27,11 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -79,10 +82,31 @@ def wav_bytes(seconds=3.0, rate=8000):
     return buf.getvalue()
 
 
+_FLAC: dict = {}
+
+
 def flac_bytes(seconds: float) -> bytes:
-    """A FLAC header the app can read a length from: fLaC, STREAMINFO with a
-    sample rate and a total-samples count. It does not decode, which nothing
-    in the tests needs it to."""
+    """A FLAC file `seconds` long. A real one, made with ffmpeg, when there
+    is an ffmpeg — the join of a long song decodes the parts — and otherwise
+    a header the app can at least read the length from."""
+    key = round(seconds, 2)
+    if key in _FLAC:
+        return _FLAC[key]
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        with tempfile.TemporaryDirectory() as tmp:
+            dst = f"{tmp}/a.flac"
+            done = subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+                                   "-i", f"anullsrc=r=8000:cl=mono:d={seconds}",
+                                   dst], capture_output=True)
+            if done.returncode == 0 and os.path.getsize(dst):
+                _FLAC[key] = open(dst, "rb").read()
+                return _FLAC[key]
+    _FLAC[key] = fake_flac(seconds)
+    return _FLAC[key]
+
+
+def fake_flac(seconds: float) -> bytes:
     rate, total = 32000, int(32000 * seconds)
     packed = (rate << 44) | (1 << 41) | (15 << 36) | total
     info = (b"\x00\x10\x00\x10" + b"\x00\x00\x00" + b"\x00\x00\x00"
@@ -135,10 +159,41 @@ def finish(pid, status, outputs=None, messages=None):
                         "outputs": outputs or {}}
 
 
+UPLOADS: dict = {}          # name -> seconds, for LoadAudio
+
+
+def _join(pid, graph, save_id):
+    """A join graph: LoadAudio parts into AudioConcat, saved. The result is
+    as long as its parts together."""
+    total = 0.0
+    for nid, node in graph.items():
+        if node["class_type"] == "LoadAudio":
+            name = node["inputs"].get("audio", "")
+            if name not in UPLOADS:
+                finish(pid, "error", messages=[["execution_error", {
+                    "node_type": "LoadAudio",
+                    "exception_message": f"Invalid audio file: {name}"}]])
+                return
+            total += UPLOADS[name]
+    time.sleep(0.3)
+    fmt = (graph[save_id]["inputs"].get("format") or "flac")
+    name = f"{pid}.{fmt}"
+    PROMPTS[name] = total
+    ws_send({"type": "execution_success", "data": {"prompt_id": pid}})
+    finish(pid, "success", outputs={save_id: {"audio": [
+        {"filename": name, "subfolder": "audio", "type": "output"}]}})
+
+
 def _execute(pid, graph):
     ws_send({"type": "execution_start", "data": {"prompt_id": pid}})
     fail = os.environ.get("MOCK_FAIL_NODE", "")
     enc_id, enc = node_of(graph, "MiniMaxMusic3TextEncode")
+    if enc_id is None:
+        save_id, _ = node_of(graph, "SaveAudioAdvanced")
+        if save_id is None:
+            save_id, _ = node_of(graph, "SaveAudio")
+        _join(pid, graph, save_id)
+        return
     ks_id, ks = node_of(graph, "KSampler")
     save_id, _ = node_of(graph, "SaveAudioAdvanced")
     if save_id is None:
@@ -269,6 +324,28 @@ def validate(graph):
     return errs
 
 
+def probe_seconds(data: bytes) -> float:
+    """How long an uploaded file is, from its own header (flac) or ffprobe."""
+    if data[:4] == b"fLaC":
+        packed = int.from_bytes(data[18:26], "big")
+        rate, total = packed >> 44, packed & ((1 << 36) - 1)
+        if rate and total:
+            return total / rate
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as fh:
+            fh.write(data)
+        try:
+            out = subprocess.run([ffprobe, "-v", "error", "-show_entries",
+                                  "format=duration", "-of",
+                                  "default=noprint_wrappers=1:nokey=1", fh.name],
+                                 capture_output=True, text=True, timeout=20).stdout
+            return float(out.strip() or 0)
+        finally:
+            os.unlink(fh.name)
+    return 0.0
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -330,7 +407,7 @@ class H(BaseHTTPRequestHandler):
             if name.endswith(".flac"):
                 self._send(200, flac_bytes(seconds), "audio/flac")
             else:
-                self._send(200, wav_bytes(), "audio/mpeg")
+                self._send(200, wav_bytes(seconds), "audio/mpeg")
         else:
             self._send(404, {"error": "no route " + p})
 
@@ -354,6 +431,22 @@ class H(BaseHTTPRequestHandler):
                     "a").write(json.dumps({"pid": pid, "prompt": graph}) + "\n")
             threading.Thread(target=execute, args=(pid, graph), daemon=True).start()
             self._send(200, {"prompt_id": pid, "number": 1, "node_errors": {}})
+        elif p == "/upload/image":
+            # A multipart upload: keep the file's name and its length, which
+            # is what a later LoadAudio of it needs to answer with.
+            import email
+            from email import policy
+            msg = email.message_from_bytes(
+                b"Content-Type: " + self.headers.get("Content-Type", "").encode()
+                + b"\r\n\r\n" + raw, policy=policy.default)
+            name, seconds = "", 0.0
+            for part in msg.iter_parts():
+                if part.get_param("name", header="content-disposition") == "image":
+                    name = part.get_filename() or "upload"
+                    data = part.get_payload(decode=True) or b""
+                    seconds = probe_seconds(data)
+            UPLOADS[name] = seconds
+            self._send(200, {"name": name, "subfolder": "", "type": "input"})
         elif p == "/interrupt":
             with LOCK:
                 INTERRUPTS.extend(QUEUE_RUNNING)

@@ -9,6 +9,7 @@ import bootstrap
 import comfy
 import lyricist
 import manager
+import parts
 
 OBJECT_INFO = json.loads((Path(__file__).with_name("object_info.json")).read_text())
 
@@ -192,13 +193,61 @@ Neon on my skin
             bare["lyrics"].startswith("just") and bare["warnings"])
     req = lyricist.clean_request({"want": "caption", "lyrics": "[Verse]\nx",
                                   "vocal": "duet", "duration": 9999})
-    s.check("requests are bounded", req["duration"] == 360 and req["vocal"] == "duet")
+    s.check("requests are bounded", req["duration"] == 1800 and req["vocal"] == "duet")
     prompt = lyricist.user_prompt(req)
     s.check("a caption-only ask keeps the lyrics exactly",
             "keep exactly" in prompt and "[Verse]" in prompt, prompt)
     auto = lyricist.clean_request({"auto": True, "duration": 360})
     s.check("Auto length means a typical song, not the ceiling",
             auto["duration"] == lyricist.TYPICAL_SECONDS)
+    # ---- a long song, in parts -----------------------------------------
+    verse = lambda n: "[Verse]\n" + "\n".join(f"line {n} {i}" for i in range(8))
+    chorus = "[Chorus]\n" + "\n".join("hook" for _ in range(4))
+    song = "\n\n".join(["[Intro]", verse(1), chorus, verse(2), chorus,
+                         "[Bridge]\nturn\nturn\nturn\nturn", "[Solo]", chorus,
+                         verse(3), chorus, "[Outro]"])
+    est = parts.estimate_seconds(song)
+    s.check("an eleven-section song estimates a full-length song", 300 <= est <= 400, str(est))
+    double = parts.estimate_seconds(song + "\n\n" + song)
+    s.check("twice the sections estimates past one pass", double > 360, str(double))
+    s.check("no lyrics estimate the node's default", parts.estimate_seconds("") == 120)
+    one = parts.plan(song, False, 300)
+    s.check("a song that fits is one part with all its sections",
+            len(one) == 1 and one[0]["lyrics"].count("[") == 11
+            and one[0]["seconds"] == 300, str(one)[:200])
+    two = parts.plan(song, False, 540)
+    s.check("nine minutes is two parts", len(two) == 2 and two[0]["count"] == 2)
+    s.check("every section lands in exactly one part, in order",
+            "\n\n".join(x["lyrics"] for x in two) == song,
+            repr("\n\n".join(x["lyrics"] for x in two))[:200])
+    s.check("parts are cut at section boundaries",
+            all(x["lyrics"].startswith("[") for x in two))
+    s.check("each part's ceiling is within one pass and near its share",
+            all(60 <= x["seconds"] <= 360 for x in two)
+            and 480 <= sum(x["seconds"] for x in two) <= 660,
+            str([x["seconds"] for x in two]))
+    four = parts.plan(song, False, 1200)
+    s.check("twenty minutes is four parts, balanced by content",
+            len(four) == 4 and max(len(x["lyrics"]) for x in four)
+            < 3 * min(len(x["lyrics"]) for x in four), str([len(x["lyrics"]) for x in four]))
+    short = parts.plan("[Verse]\nonly one section", False, 900)
+    s.check("fewer sections than parts means fewer parts", len(short) == 1)
+    inst = parts.plan("", True, 800)
+    s.check("an instrumental with no lyrics repeats a plain structure",
+            len(inst) == 3 and all(x["lyrics"] == parts.INSTRUMENTAL_LYRICS for x in inst)
+            and sum(x["seconds"] for x in inst) >= 780, str(inst))
+    cap = parts.part_caption("Roots reggae.", 2, 3)
+    s.check("a middle part is told it is one song, no intro, no ending",
+            cap.startswith("Roots reggae.") and "part 2 of 3" in cap
+            and "no intro" in cap and "without an outro" in cap, cap)
+    s.check("a single part's caption is untouched",
+            parts.part_caption("x", 1, 1) == "x")
+    g = c.build_join_prompt(["a.flac", "b.flac", "c.flac"], "mp3")["prompt"]
+    kinds = [n["class_type"] for n in g.values()]
+    s.check("the join graph loads each part and chains the concats",
+            kinds.count("LoadAudio") == 3 and kinds.count("AudioConcat") == 2
+            and g["c2"]["inputs"]["audio1"] == ["c1", 0]
+            and g[comfy.N_SAVE]["inputs"]["audio"] == ["c2", 0], str(g)[:300])
     return s
 
 
