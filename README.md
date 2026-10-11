@@ -48,14 +48,18 @@ MiniMax Music 3 has three parts:
 The defaults are already the 8 GB choice: int8 everywhere, and **Low VRAM
 decode** on. What to expect:
 
-- **It works, but slowly.** Streaming the text encoder means each second of
-  music takes noticeably longer to write than on a 24 GB card. Plan on
-  several minutes of rendering per minute of song. Nobody has published
-  RTX 4060 timings yet, so the job card shows elapsed time and the library
-  records how long each song took (**Caption and lyrics → Rendered in**).
-- **Start short.** Try 1:00 to 2:00 first. Length is a ceiling. The model ends
-  the song when the song ends, but render time grows with the length you
-  allow.
+- **It works, but slowly.** Measured on an RTX 4060 (8 GB): a 2:00 song took
+  **34½ minutes**, 32 of them writing the song and under 2 rendering the
+  audio, so about **16 minutes per minute of music**. The job card shows
+  the frames written so far and the elapsed time; the library records how
+  long each song took (**Caption and lyrics → Rendered in**).
+- **Length is a ceiling, and Auto fits it to the lyrics.** The model ends the
+  song when the song ends; a ceiling shorter than the lyrics cuts the last
+  sections off (badged **CUT**), which looks like the `[Section]` tags being
+  ignored. Auto reads the lyrics and adds headroom (60 s to 6:00). Time is
+  only spent on what is written, but the encoder reserves memory for the
+  whole ceiling (about 1 GB per two minutes), so don't set 6:00 for a short
+  song.
 - **System RAM matters.** The part of the text encoder that is not on the
   card waits in RAM. 32 GB is comfortable; 16 GB is the floor. The Engine
   page's *Graphics card and memory* row checks this.

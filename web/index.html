@@ -520,8 +520,9 @@
               <svg viewBox="0 0 24 24"><path d="M3 7h4l10 10h4M3 17h4l3-3M18 4l3 3-3 3M18 14l3 3-3 3"/></svg></button>
             <span id="styleChips" style="display:contents"></span>
           </div>
-          <p class="note" style="margin:0;padding:0 16px 12px">Tags go on a <i>Tags:</i>
-            line at the end of the caption. Press one again to take it out.</p>
+          <p class="note" style="margin:0;padding:0 16px 12px">A tag joins the caption
+            as words — the first line, or the Basic Attributes line of a structured
+            caption. Press one again to take it out.</p>
         </details>
 
         <details class="card" id="cardGenres">
@@ -1011,24 +1012,49 @@ const GENRES = GENRE_FAMILIES.reduce((all, f) => all.concat(f.genres), [])
   .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
 const ALL_TAGS = BASE_TAGS.concat(GENRES);
 let chipPool = BASE_TAGS.slice(0, 18);
-const TAGS_LINE = /^\s*tags\s*:\s*(.*)$/im;
-function captionTags() {
-  const m = $("caption").value.match(TAGS_LINE);
-  return m ? m[1].split(",").map((x) => x.trim()).filter(Boolean) : [];
+/* Tags are words in the caption, comma-separated, the way a free-form
+   caption is written ("haunting roots reggae, minor key, 68 BPM"). The model
+   reads prose; a separate "Tags:" line was not something it was trained on,
+   and in the first real song it was ignored. In a structured caption they
+   join the Basic Attributes line of Global Metadata; otherwise the first
+   paragraph. A chip is lit when its tag is a whole comma-separated part. */
+const BASIC_LINE = /^(\s*Basic Attributes:.*)$/im;
+const esc_re = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function captionParts(text) {
+  return (text || "").split(/[,\n]/).map((x) => x.trim().replace(/[.]+$/, "").toLowerCase())
+    .filter(Boolean);
 }
-function setCaptionTags(tags) {
-  const ta = $("caption");
-  let v = ta.value;
-  const line = tags.length ? "Tags: " + tags.join(", ") : "";
-  if (TAGS_LINE.test(v)) v = v.replace(TAGS_LINE, line).replace(/\n{3,}/g, "\n\n").trim();
-  else if (line) v = (v.trim() ? v.trim() + "\n\n" : "") + line;
-  ta.value = v; captionChanged();
+function captionTags() {
+  const have = captionParts($("caption").value);
+  return ALL_TAGS.filter((t) => have.indexOf(t.toLowerCase()) >= 0);
+}
+function tagLine(v) {
+  const m = v.match(BASIC_LINE);
+  if (m) return m[1];
+  const first = v.split("\n").find((ln) => ln.trim());
+  return first === undefined ? "" : first;
 }
 function toggleTag(c) {
-  const tags = captionTags();
-  const i = tags.findIndex((p) => p.toLowerCase() === c.toLowerCase());
-  if (i >= 0) tags.splice(i, 1); else tags.push(c);
-  setCaptionTags(tags);
+  const ta = $("caption");
+  let v = ta.value;
+  const part = new RegExp("(^|,)\\s*" + esc_re(c) + "\\s*(?=,|\\.\\s*$|$)", "im");
+  const hit = v.split("\n").findIndex((ln) => part.test(ln));
+  if (hit >= 0) {
+    const lines = v.split("\n");
+    lines[hit] = lines[hit].replace(part, "$1").replace(/,\s*,/g, ",")
+      .replace(/^\s*,\s*/, "").replace(/,\s*(?=\.\s*$|$)/, "")
+      .replace(/:\s*,\s*/, ": ").replace(/,\s*/g, ", ").trimEnd();
+    v = lines.join("\n");
+  } else {
+    const line = tagLine(v);
+    if (!line) v = c;
+    else {
+      const ends = /\.\s*$/.test(line);
+      const joined = line.replace(/[\s.]+$/, "") + ", " + c + (ends ? "." : "");
+      v = v.replace(line, joined);
+    }
+  }
+  ta.value = v; captionChanged();
 }
 function buildChips() {
   const box = $("styleChips"); box.innerHTML = "";
@@ -1112,8 +1138,7 @@ function captionChanged() {
 }
 function applyPreset(i) {
   const p = PRESETS[i]; if (!p) return;
-  const tags = captionTags();
-  $("caption").value = p.caption + (tags.length ? "\n\nTags: " + tags.join(", ") : "");
+  $("caption").value = p.caption;
   if (p.vocal !== undefined) setVocal(p.vocal);
   captionChanged();
   toast("Preset “" + p.name + "” loaded. Edit it however you like.");
@@ -1130,6 +1155,7 @@ function wireSeg(id, onChange) {
 }
 function setVocal(v) {
   segSet("segVocal", v || "");
+  if ($("duration").options.length) autoNote();
   const inst = v === "instrumental";
   $("lyrics").style.opacity = inst ? ".5" : "1";
   $("lyrics").title = inst ? "No vocals: only the [Section] tags here are used, as structure." : "";
@@ -1152,7 +1178,29 @@ function modelHint(role, name) {
   return name + " is " + gb(st.model_sizes[name]) + " and this card has " + gb(st.vram_total)
     + ", so ComfyUI streams it through the card in pieces. It works, more slowly.\n\n" + base;
 }
-function recommended() { return (S.status && S.status.recommended_duration) || 120; }
+/* What Auto asks for. The ceiling is read from the lyrics, not from the
+   node's 2:00 default: the model ends the song when the song ends, and a
+   ceiling shorter than the lyrics cuts the last sections off — which is
+   what happened to the first real song. Time is only spent on what is
+   written, but the encoder reserves memory for the whole ceiling (about
+   1 GB per two minutes on the card), so it is the lyrics plus headroom,
+   never simply the 6:00 maximum. */
+const INSTRUMENTAL_TAG = /^\s*\[(intro|outro|instrumental|solo|interlude|break)[^\]]*\]\s*$/i;
+function lyricsSeconds(text, instrumental) {
+  const lines = (text || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const tags = lines.filter((l) => /^\[[^\]]+\]$/.test(l));
+  const sung = instrumental ? 0 : lines.length - tags.length;
+  const breaks = tags.filter((l) => INSTRUMENTAL_TAG.test(l)).length;
+  if (!sung && !tags.length) return 120;
+  // ~4 s a sung line, ~12 s an instrumental section, a third again for
+  // the intros, turnarounds and endings the words do not show.
+  const est = (sung * 4 + breaks * 12 + Math.max(0, tags.length - breaks) * 3) * 1.35;
+  const limit = (S.status && S.status.max_duration) || 360;
+  return Math.max(60, Math.min(limit, Math.ceil(est / 30) * 30));
+}
+function recommended() {
+  return lyricsSeconds($("lyrics").value, segGet("segVocal") === "instrumental");
+}
 function readOpts() {
   const picked = $("duration").value;
   return { vocal:segGet("segVocal"), tiled:segGet("segTiled"),
@@ -1207,8 +1255,9 @@ function visibleTracks(filterText) {
    song plays like any other until the ending is missing, so say so on it. */
 function cutNote(t) {
   return "This song reached its " + fmtTime(t.duration || t.seconds || 0) + " length "
-    + "limit before it ended, so the ending is cut off. Make it again with a longer "
-    + "Length, or with shorter lyrics.";
+    + "limit before it ended, so the ending is cut off — any sections after that point "
+    + "were never sung. Make it again with a longer Length (Auto now sizes it to the "
+    + "lyrics), or with shorter lyrics.";
 }
 const ICON_PLAY = '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>';
 function renderTracks() {
@@ -1619,13 +1668,9 @@ function applyLyrics(r, want) {
     S.hist.push(r.lyrics);
     if (S.hist.length > 60) S.hist.splice(0, S.hist.length - 60);
     S.histAt = S.hist.length - 1;
-    $("lyrics").value = r.lyrics; lyricsNote();
+    $("lyrics").value = r.lyrics; lyricsNote(); autoNote();
   }
-  if ((want === "song" || want === "caption") && r.caption) {
-    const tags = captionTags();
-    $("caption").value = r.caption + (tags.length && !TAGS_LINE.test(r.caption)
-      ? "\n\nTags: " + tags.join(", ") : "");
-  }
+  if ((want === "song" || want === "caption") && r.caption) $("caption").value = r.caption;
   if ((want === "song" || want === "caption" || !$("songTitle").value) && r.title)
     $("songTitle").value = r.title;
   $("lyrDraft").hidden = true;
@@ -2149,9 +2194,10 @@ function cardHint(st) {
   if (!v || v >= 12e9) { el.hidden = true; return; }
   el.hidden = false;
   el.innerHTML = "<b>" + gib(v) + " GB card.</b> The 9 GB text encoder is " +
-    "streamed through the card while the song is written, so expect several minutes per " +
-    "minute of music. Start with 1:00–2:00, keep Low VRAM decode on, and close anything " +
-    "else using the GPU (games, video, a local chat model).";
+    "streamed through the card while the song is written: measured on an RTX 4060, " +
+    "about 16 minutes per minute of music (a 2:00 song took 35 minutes). Auto length " +
+    "fits the lyrics; keep Low VRAM decode on, and close anything else using the GPU " +
+    "(games, video, a local chat model).";
 }
 async function refreshStatus() {
   let st; try { st = await api("/api/status"); } catch (e) { return; }
@@ -2200,11 +2246,18 @@ function fillDurations(limit) {
     sel.innerHTML = "";
     want.forEach((v) => {
       const o = document.createElement("option"); o.value = v;
-      o.textContent = v === "auto" ? "Auto — " + fmtTime(recommended()) : fmtTime(Number(v));
+      o.textContent = v === "auto" ? "Auto — fits the lyrics" : fmtTime(Number(v));
       sel.appendChild(o);
     });
   }
   sel.value = want.indexOf(keep) >= 0 ? keep : "auto";
+  autoNote();
+}
+/* The Auto option says what it would ask for right now, since that moves
+   with every line of lyrics. */
+function autoNote() {
+  const o = $("duration").options[0];
+  if (o) o.textContent = "Auto — " + fmtTime(recommended()) + " for these lyrics";
 }
 function fill(sel, values, preferred) {
   const keep = sel.value; sel.innerHTML = "";
@@ -2315,7 +2368,7 @@ function wire() {
 
   // lyrics
   $("lyrics").addEventListener("input", () => {
-    lyricsNote();
+    lyricsNote(); autoNote();
     S.hist.push($("lyrics").value);
     if (S.hist.length > 60) S.hist.shift();
     S.histAt = S.hist.length - 1; saveDraft(); });

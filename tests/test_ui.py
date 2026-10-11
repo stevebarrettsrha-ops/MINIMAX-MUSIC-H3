@@ -48,12 +48,36 @@ def run() -> Suite:
                 "structured" in page.inner_text("#capCount"))
         page.click("#styleChips .chip >> nth=0")
         tag = page.eval_on_selector("#styleChips .chip", "b => b.textContent")
-        s.check("a tag chip writes a Tags line and lights up",
-                ("Tags: " + tag) in page.input_value("#caption")
-                and "on" in page.get_attribute("#styleChips .chip >> nth=0", "class"))
+        basic = next(ln for ln in page.input_value("#caption").split("\n")
+                     if ln.startswith("Basic Attributes:"))
+        s.check("a tag chip joins the Basic Attributes line as words and lights up",
+                basic.endswith(", " + tag + ".")
+                and "on" in page.get_attribute("#styleChips .chip >> nth=0", "class"), basic)
+        page.click("#styleChips .chip >> nth=1")
         page.click("#styleChips .chip >> nth=0")
-        s.check("pressing it again takes it out",
-                "Tags:" not in page.input_value("#caption"))
+        basic = next(ln for ln in page.input_value("#caption").split("\n")
+                     if ln.startswith("Basic Attributes:"))
+        tag2 = page.eval_on_selector("#styleChips .chip >> nth=1", "b => b.textContent")
+        s.check("pressing it again takes only that tag out, commas intact",
+                tag not in basic and basic.endswith(", " + tag2 + ".")
+                and ",," not in basic, basic)
+        page.fill("#caption", "haunting roots reggae, minor key, 68 BPM")
+        page.click("#styleChips .chip >> nth=2")
+        tag3 = page.eval_on_selector("#styleChips .chip >> nth=2", "b => b.textContent")
+        s.check("in a free-form caption a tag joins the first line",
+                page.input_value("#caption") == "haunting roots reggae, minor key, 68 BPM, " + tag3,
+                page.input_value("#caption"))
+        page.select_option("#preset", index=1)
+        est = page.evaluate("lyricsSeconds('[Intro]\\n\\n[Verse]\\n' + 'la la la\\n'.repeat(8) "
+                            "+ '[Chorus]\\n' + 'oh\\n'.repeat(4) + '[Verse]\\n' + 'la\\n'.repeat(8) "
+                            "+ '[Chorus]\\n' + 'oh\\n'.repeat(4) + '[Bridge]\\n' + 'hm\\n'.repeat(4) "
+                            "+ '[Chorus]\\n' + 'oh\\n'.repeat(4) + '[Outro]', false)")
+        s.check("Auto length grows with the lyrics (a full song is well past 2:00)",
+                210 <= est <= 300, str(est))
+        s.check("Auto length for no lyrics is the node's 2:00",
+                page.evaluate("lyricsSeconds('', false)") == 120)
+        s.check("the Auto option says what it asks for",
+                "for these lyrics" in page.eval_on_selector("#duration option", "o => o.textContent"))
         page.fill("#lyrics", "Sun on the water")
         page.wait_for_selector("#lyricsNote:not([hidden])")
         s.check("untagged lyrics get a note about structure",
