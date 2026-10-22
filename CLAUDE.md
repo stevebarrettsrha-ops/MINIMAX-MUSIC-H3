@@ -51,6 +51,20 @@ carry over were learned there the hard way, so keep them.
     (bound to the address they were entered for, https or loopback only).
     Auto length reaches it as `TYPICAL_SECONDS`, never the 360 s ceiling,
     and a local writer is told to release the GPU after every write.
+15. **A saved path can be there and still wrong.** An app folder on a drive
+    shared by Windows and Linux carries the Windows
+    `comfy-venv/Scripts/python.exe` and `data/tools/ffmpeg/bin/ffmpeg.exe`;
+    they exist, and every run of them is `[Errno 8] Exec format error`.
+    `foreign_binary()` reads the first bytes (MZ, ELF, Mach-O); `heal_paths()`
+    clears a foreign interpreter, `comfy_python()` / `existing_python()` and
+    `find_tool()` pass over one. The foreign venv is never rebuilt in place —
+    that would break it for the other system — so `venv_dir()` gives this one
+    `comfy-venv-linux` (or `-windows`, `-darwin`) beside it, and `run.sh` does
+    the same for a Windows `.venv` (`.venv-linux`). Setup never stores the
+    interpreter that *builds* the venv (often the app's own, torch-less) as
+    `cfg["python"]`, and `verify_locations()` never adopts it for a managed
+    engine. apt-get runs as `sudo -n`, or `pkexec` on a desktop where sudo
+    needs a password; a failure names the command to run by hand.
 
 ## Music 3 specifics
 

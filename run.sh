@@ -100,7 +100,15 @@ echo "  Using: $("$PY" -c 'import sys;print(sys.executable)')"
 # python3-venv, `venv` dies after writing bin/python but before pip, and keeping
 # that half-built folder made every later run fail with "No module named pip"
 # even once the package was installed.
+#
+# A folder first set up on Windows (a drive both systems share) can carry a
+# Windows .venv — Scripts/python.exe and no bin/python. It can never run here,
+# and the rebuild below would delete it out from under Windows, so this system
+# gets its own beside it.
 VENV=".venv"
+if [ -e .venv/Scripts/python.exe ] && [ ! -e .venv/bin/python ]; then
+  VENV=".venv-$(uname -s | tr '[:upper:]' '[:lower:]')"
+fi
 if [ -e "$VENV" ] && ! "$VENV/bin/python" -c 'import pip' >/dev/null 2>&1; then
   echo "  The existing environment is incomplete or no longer runs. Building it again."
   rm -rf "$VENV"

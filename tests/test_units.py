@@ -156,6 +156,117 @@ def run() -> Suite:
             and manager.guess_folder("minimax_music3_dav.safetensors") == "vae"
             and manager.guess_folder("x_dit_fp16.safetensors") == "diffusion_models")
 
+    # ---- set up on Windows, opened on Linux (a drive shared by both) -----
+    # The Windows venv and ffmpeg are still on disk, so they "exist"; every
+    # run of them is [Errno 8] Exec format error and the engine never starts.
+    import os
+    import platform as _platform
+    import subprocess as _subprocess
+    from unittest.mock import patch as _patch
+    with tempfile.TemporaryDirectory() as tmp, \
+            _patch.object(_platform, "system", return_value="Linux"):
+        app = Path(tmp) / "minimax-music-h3-main"
+        comfy_dir = app / "ComfyUI"
+        (comfy_dir / "models").mkdir(parents=True)
+        (comfy_dir / "main.py").write_text("")
+        (comfy_dir / "requirements.txt").write_text("")
+        win_py = app / "comfy-venv" / "Scripts" / "python.exe"
+        win_py.parent.mkdir(parents=True)
+        win_py.write_bytes(b"MZ\x90\x00" + b"\x00" * 60)
+        elf = app / "elf"
+        elf.write_bytes(b"\x7fELF\x02\x01")
+        s.check("a Windows .exe is foreign on Linux",
+                bootstrap.foreign_binary(win_py))
+        s.check("an ELF binary is native on Linux",
+                not bootstrap.foreign_binary(elf))
+        s.check("a script or unreadable file is never called foreign",
+                not bootstrap.foreign_binary(comfy_dir / "main.py")
+                and not bootstrap.foreign_binary(app / "nope"))
+        with _patch.object(_platform, "system", return_value="Windows"):
+            s.check("an ELF binary is foreign on Windows",
+                    bootstrap.foreign_binary(elf))
+
+        cfg_w = dict(bootstrap.DEFAULT_CONFIG, comfy_dir=str(comfy_dir),
+                     models_dir=str(comfy_dir / "models"), python=str(win_py),
+                     setup_complete=True, managed=True)
+        s.check("comfy_python does not hand out the foreign interpreter",
+                manager.comfy_python(cfg_w) == "",
+                manager.comfy_python(cfg_w))
+        notes = bootstrap.heal_paths(cfg_w)
+        s.check("a saved interpreter built for Windows is cleared on Linux",
+                cfg_w["python"] == "", cfg_w["python"])
+        s.check("and the reason is reported",
+                any("another operating system" in n for n in notes),
+                "; ".join(notes))
+        moved = dict(cfg_w, python="D:\\AI\\minimax-music-h3-main\\"
+                     "comfy-venv\\Scripts\\python.exe")
+        real_app = bootstrap.APP_DIR
+        bootstrap.APP_DIR = app
+        try:
+            bootstrap.heal_paths(moved)
+        finally:
+            bootstrap.APP_DIR = real_app
+        s.check("a rebased path that lands on the Windows python is cleared",
+                moved["python"] == "", moved["python"])
+        s.check("the Windows venv is left alone; Linux gets its own beside it",
+                bootstrap.venv_python(comfy_dir)
+                == app / "comfy-venv-linux" / "bin" / "python",
+                str(bootstrap.venv_python(comfy_dir)))
+        s.check("existing_python never runs the foreign interpreter",
+                bootstrap.existing_python(comfy_dir) == "")
+        rows = {d["id"]: d for d in manager.dependencies(cfg_w)}
+        s.check("PyTorch says the old venv is for another system, not Errno 8",
+                rows["torch"]["state"] == "missing"
+                and "another operating system" in rows["torch"]["detail"]
+                and rows["torch"]["action"] == "install",
+                rows["torch"]["detail"][:90])
+        s.check("ComfyUI packages are missing and point at PyTorch first",
+                rows["comfy_reqs"]["state"] == "missing"
+                and "PyTorch first" in rows["comfy_reqs"]["detail"],
+                rows["comfy_reqs"]["detail"])
+        (app / "comfy-venv" / "bin").mkdir()
+        (app / "comfy-venv" / "bin" / "python").write_bytes(b"\x7fELF")
+        s.check("a comfy-venv that also has a native interpreter is used",
+                bootstrap.venv_python(comfy_dir)
+                == app / "comfy-venv" / "bin" / "python")
+
+        real_tools = bootstrap.TOOLS_DIR
+        bootstrap.TOOLS_DIR = app / "data" / "tools"
+        try:
+            ffdir = bootstrap.TOOLS_DIR / "ffmpeg" / "bin"
+            ffdir.mkdir(parents=True)
+            (ffdir / "ffmpeg.exe").write_bytes(b"MZ\x90\x00")
+            s.check("a bundled Windows ffmpeg is passed over on Linux",
+                    bootstrap.find_tool("ffmpeg") != str(ffdir / "ffmpeg.exe"))
+            with _patch.object(bootstrap.shutil, "which", return_value=None):
+                rows = {d["id"]: d for d in manager.dependencies(cfg_w)}
+            s.check("and the ffmpeg row says why instead of reading ok",
+                    rows["ffmpeg"]["state"] != "ok"
+                    and "another operating system" in rows["ffmpeg"]["detail"]
+                    and rows["ffmpeg"]["action"] == "install",
+                    rows["ffmpeg"]["detail"][:90])
+        finally:
+            bootstrap.TOOLS_DIR = real_tools
+
+        # apt-get from a task with no terminal: sudo -n fails where sudo
+        # needs a password, which on a desktop Ubuntu is nearly everyone
+        task = manager.Task("t", "t")
+        no = _subprocess.CompletedProcess([], 1)
+        with _patch.object(_subprocess, "run", return_value=no), \
+                _patch.object(manager.shutil, "which",
+                              side_effect=lambda n: "/usr/bin/" + n), \
+                _patch.dict(os.environ, {"DISPLAY": ":0"}):
+            s.check("sudo that needs a password becomes pkexec on a desktop",
+                    manager._elevate(["sudo", "-n", "apt-get", "install", "-y",
+                                      "git"], task)
+                    == ["pkexec", "apt-get", "install", "-y", "git"])
+        with _patch.object(_subprocess, "run", return_value=no), \
+                _patch.dict(os.environ, {"DISPLAY": "", "WAYLAND_DISPLAY": ""}):
+            s.check("and stays sudo -n, failing fast, without one",
+                    manager._elevate(["sudo", "-n", "apt-get", "install", "-y",
+                                      "git"], task)
+                    == ["sudo", "-n", "apt-get", "install", "-y", "git"])
+
     # ---- the writer's answer -------------------------------------------
     answer = """<think>plan the song</think>
 **TITLE:** Neon Rain

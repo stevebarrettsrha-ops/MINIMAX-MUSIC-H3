@@ -2,11 +2,13 @@
 data/
 ComfyUI/
 comfy-venv/
+comfy-venv-*/
 *.part
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
+.venv-*/
 
 .DS_Store
